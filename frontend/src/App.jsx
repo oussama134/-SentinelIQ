@@ -274,7 +274,7 @@ export default function App() {
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,.04)" />
                 <XAxis dataKey="time" tick={{ fill: '#8b949e', fontSize: 11 }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fill: '#8b949e', fontSize: 11 }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fill: '#8b949e', fontSize: 11 }} axisLine={false} tickLine={false} domain={[0, dataMax => Math.max(10, dataMax)]} allowDecimals={false} />
                 <Tooltip content={<ChartTip />} />
                 <Area type="monotone" dataKey="count" name="Alerts" stroke="#388bfd" fill="url(#aGrad)" strokeWidth={2} dot={{ fill: '#388bfd', r: 3 }} />
               </AreaChart>

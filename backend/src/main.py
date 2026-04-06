@@ -41,7 +41,7 @@ _PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 MODELS_DIR      = os.path.join(_PROJECT_ROOT, "backend", "models")
 _DATA_DIR       = os.path.join(_PROJECT_ROOT, "data")
 PCAP_PATH       = os.path.join(_DATA_DIR, "live_traffic.pcap")
-CAPTURE_INTERFACE = os.getenv("NETWORK_INTERFACE", "7")
+CAPTURE_INTERFACE = os.getenv("NETWORK_INTERFACE", "2")
 CAPTURE_DURATION  = 5    # seconds — reduced for faster detection
 CAPTURE_COOLDOWN  = 0    # no pause between captures
 
