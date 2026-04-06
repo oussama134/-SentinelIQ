@@ -1,0 +1,76 @@
+"""
+SentinelIQ — Central Configuration
+All settings loaded from .env — never hardcode values
+"""
+from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+
+class Settings(BaseSettings):
+    # App
+    APP_NAME: str = "SentinelIQ"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = False
+
+    # Database
+    DB_HOST: str = "localhost"
+    DB_PORT: int = 5432
+    DB_NAME: str = "sentineliq"
+    DB_USER: str = "sentinel"
+    DB_PASSWORD: str = "sentinel123"
+
+    @property
+    def DATABASE_URL(self) -> str:
+        return f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+    @property
+    def DATABASE_URL_SYNC(self) -> str:
+        return f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+
+    # Redis
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+
+    @property
+    def REDIS_URL(self) -> str:
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}"
+
+    # Security
+    SECRET_KEY: str = "dev-secret-key-change-in-production"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+
+    # ML Model paths
+    MODEL_PATH: str = "./ml/models/lstm_model.pkl"
+    SCALER_PATH: str = "./ml/models/scaler.pkl"
+    LABEL_ENCODER_PATH: str = "./ml/models/label_encoder.pkl"
+
+    # Threat Intel APIs
+    ABUSEIPDB_API_KEY: str = ""
+    VIRUSTOTAL_API_KEY: str = ""
+
+    # Network capture
+    NETWORK_INTERFACE: str = "eth0"
+    CAPTURE_ENABLED: bool = True
+
+    # Notifications
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+
+    # AI Agent
+    OLLAMA_HOST: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3"
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    """Cached settings instance — call this everywhere"""
+    return Settings()
+
+
+settings = get_settings()
