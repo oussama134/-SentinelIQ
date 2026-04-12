@@ -17,6 +17,7 @@ const sevBg = (s) => {
 };
 const fmt = (iso) => iso ? new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
 const fmtFull = (iso) => iso ? new Date(iso).toLocaleString('fr-FR') : '—';
+const getFlag = (c) => c ? String.fromCodePoint(...[...c.toUpperCase()].map(x => 0x1f1a5 + x.charCodeAt())) : '';
 
 // ── tiny components ───────────────────────────────────────────────────────────
 const Badge = ({ sev: s, label }) => (
@@ -99,7 +100,21 @@ export default function App() {
   const [selected, setSelected] = useState(null);
   const [alertCount, setAlertCount] = useState(0);
   const [newAlerts, setNewAlerts] = useState([]);
+  const [timelineOffset, setTimelineOffset] = useState(0); // minutes backwards
   const prevCount = useRef(0);
+  
+  // Settings State
+  const [activeTab, setActiveTab] = useState('dashboard');
+  const [trustedIps, setTrustedIps] = useState([]);
+  const [newIp, setNewIp] = useState('');
+  const [newIpDesc, setNewIpDesc] = useState('');
+
+  const fetchTrustedIps = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/siem/trusted-ips`);
+      setTrustedIps(await res.json());
+    } catch (err) {}
+  }, []);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -141,10 +156,86 @@ export default function App() {
 
   useEffect(() => {
     fetchAll();
+    fetchTrustedIps();
     let iv;
     if (liveMode) iv = setInterval(fetchAll, 5000);
     return () => clearInterval(iv);
-  }, [fetchAll, liveMode]);
+  }, [fetchAll, fetchTrustedIps, liveMode]);
+
+  useEffect(() => {
+    if (window.Notification && Notification.permission !== "granted") {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (newAlerts.length > 0 && window.Notification && Notification.permission === "granted") {
+      newAlerts.forEach(a => {
+        if (a.severity.includes('HIGH') || a.severity.includes('CRITICAL')) {
+          new Notification("🚨 SentinelIQ Alert: " + a.title, {
+            body: `Severity: ${a.severity}\nIP: ${a.src_ip}\nType: ${a.attack_type}`,
+            icon: '/favicon.ico'
+          });
+        }
+      });
+    }
+  }, [newAlerts]);
+
+  const handleBlockIP = async (id, ip) => {
+    if (!window.confirm(`⚠️ Are you sure you want to block ${ip} via Windows Defender Firewall?`)) return;
+    try {
+      const res = await fetch(`${API}/api/siem/alerts/${id}/block`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert(`✅ IP ${ip} successfully blocked at the OS Firewall level!\nStatus: ${data.firewall_status}`);
+        fetchAll();
+      } else {
+        alert(`Failed to block: ${data.error || data.detail}`);
+      }
+    } catch(err) {
+      alert("Error contacting backend.");
+    }
+  };
+
+  const handleUnblockIP = async (id, ip) => {
+    if (!window.confirm(`⚠️ Are you sure you want to UNBLOCK ${ip} and remove it from Windows Defender Firewall?`)) return;
+    try {
+      const res = await fetch(`${API}/api/siem/alerts/${id}/unblock`, { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert(`✅ IP ${ip} successfully UNBLOCKED!`);
+        fetchAll();
+      } else {
+        alert(`Failed to unblock: ${data.error || data.detail}`);
+      }
+    } catch(err) {
+      alert("Error contacting backend.");
+    }
+  };
+
+  const addTrustedIp = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await fetch(`${API}/api/siem/trusted-ips`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip_prefix: newIp, description: newIpDesc })
+      });
+      if (!res.ok) {
+        throw new Error(`Server responded with ${res.status}`);
+      }
+      setNewIp('');
+      setNewIpDesc('');
+      fetchTrustedIps();
+    } catch (err) {
+      alert(`Erreur de connexion a l'API: ${err.message}. Veuillez reessayer.`);
+    }
+  };
+
+  const deleteTrustedIp = async (id) => {
+    await fetch(`${API}/api/siem/trusted-ips/${id}`, { method: 'DELETE' });
+    fetchTrustedIps();
+  };
 
   // ── derived data ──────────────────────────────────────────────────────────
   const bySeverity = dashboard?.by_severity || {};
@@ -155,14 +246,15 @@ export default function App() {
   // alert timeline (last 10 buckets of 1 min)
   const timeline = (() => {
     const buckets = {};
-    const now = Date.now();
+    const now = Date.now() - (timelineOffset * 60 * 1000);
     for (let i = 9; i >= 0; i--) {
       const key = new Date(now - i * 60000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
       buckets[key] = 0;
     }
     alerts.forEach(a => {
       if (!a.created_at) return;
-      const k = new Date(a.created_at + 'Z').toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      const isoStr = a.created_at.endsWith('Z') ? a.created_at : a.created_at + 'Z';
+      const k = new Date(isoStr).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
       if (k in buckets) buckets[k]++;
     });
     return Object.entries(buckets).map(([time, count]) => ({ time, count }));
@@ -212,8 +304,14 @@ export default function App() {
           <span style={{ fontWeight: 800, fontSize: 16, background: 'linear-gradient(135deg, #388bfd, #39d0d8)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>
             SentinelIQ
           </span>
-          <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>/ Live Dashboard</span>
+          <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>/ {activeTab === 'dashboard' ? 'Live Dashboard' : 'Settings'}</span>
         </div>
+        
+        <div style={{ display: 'flex', gap: 16, marginLeft: 32 }}>
+          <button onClick={() => setActiveTab('dashboard')} style={{ background: 'none', border: 'none', color: activeTab === 'dashboard' ? '#388bfd' : 'var(--text-secondary)', fontWeight: 600, cursor: 'pointer' }}>Dashboard</button>
+          <button onClick={() => setActiveTab('settings')} style={{ background: 'none', border: 'none', color: activeTab === 'settings' ? '#388bfd' : 'var(--text-secondary)', fontWeight: 600, cursor: 'pointer' }}>⚙️ Settings</button>
+        </div>
+
         <div style={{ flex: 1 }} />
 
         {/* live indicator */}
@@ -244,15 +342,55 @@ export default function App() {
           boxShadow: '0 4px 24px rgba(248,81,73,.3)', animation: 'slideIn .3s ease'
         }}>
           <p style={{ fontSize: 13, fontWeight: 700, color: '#f85149' }}>🚨 New SIEM Alert</p>
-          <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>{a.title}</p>
+          <p style={{ fontSize: 13, fontWeight: 500 }}>{a.attack_type} from {a.src_ip}</p>
         </div>
       ))}
 
-      <div style={{ padding: '24px 32px', display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {activeTab === 'settings' ? (
+        <div style={{ maxWidth: 800, margin: '40px auto' }}>
+          <h2>⚙️ Platform Settings</h2>
+          
+          <div className="card" style={{ marginTop: 24 }}>
+            <p className="card-title">✅ Trusted IPs (Whitelist)</p>
+            <p style={{ color: 'var(--text-dim)', fontSize: 13, marginBottom: 16 }}>
+              Add IP prefixes to permanently ignore them from SIEM processing and reduce false positives.
+            </p>
+            
+            <form onSubmit={addTrustedIp} style={{ display: 'flex', gap: 12, marginBottom: 24 }}>
+              <input value={newIp} onChange={e => setNewIp(e.target.value)} placeholder="IP Prefix (e.g. 192.168.1.)" required style={{ background: '#0d1929', color: 'white', border: '1px solid var(--border)', padding: '8px 12px', borderRadius: 6, flex: 1 }} />
+              <input value={newIpDesc} onChange={e => setNewIpDesc(e.target.value)} placeholder="Description (e.g. Home Router)" required style={{ background: '#0d1929', color: 'white', border: '1px solid var(--border)', padding: '8px 12px', borderRadius: 6, flex: 2 }} />
+              <button type="submit" style={{ background: '#3fb950', color: 'white', border: 'none', padding: '8px 16px', borderRadius: 6, fontWeight: 600, cursor: 'pointer' }}>Add IP</button>
+            </form>
+
+            <table style={{ width: '100%', textAlign: 'left', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--text-dim)' }}>
+                  <th style={{ padding: '8px 0' }}>IP Prefix</th>
+                  <th>Description</th>
+                  <th>Added At</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trustedIps.map(ip => (
+                  <tr key={ip.id} style={{ borderBottom: '1px solid var(--border)' }}>
+                    <td className="mono" style={{ padding: '12px 0' }}>{ip.ip_prefix}</td>
+                    <td>{ip.description}</td>
+                    <td style={{ color: 'var(--text-dim)' }}>{fmtFull(ip.added_at)}</td>
+                    <td><button onClick={() => deleteTrustedIp(ip.id)} style={{ background: 'none', border: 'none', color: '#f85149', cursor: 'pointer', fontWeight: 600 }}>Delete</button></td>
+                  </tr>
+                ))}
+                {trustedIps.length === 0 && <tr><td colSpan="4" style={{ padding: 16, textAlign: 'center', color: 'var(--text-dim)' }}>No trusted IPs configured.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : (
+        <div style={{ padding: '24px 32px', display: 'flex', flexDirection: 'column', gap: 20 }}>
 
         {/* ── STAT CARDS ── */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
-          <StatCard icon="🚨" label="Total Alerts" value={dashboard?.total_alerts_24h ?? alertCount} sub="Last 24h" color="#f85149" pulse={liveMode} />
+          <StatCard icon="🚨" label="Total Alerts" value={dashboard?.total_alerts ?? alertCount} sub="Lifetime" color="#f85149" pulse={liveMode} />
           <StatCard icon="💀" label="Critical" value={bySeverity['SeverityLevel.CRITICAL'] ?? bySeverity['CRITICAL'] ?? 0} color="#f85149" />
           <StatCard icon="🔥" label="High" value={bySeverity['SeverityLevel.HIGH'] ?? bySeverity['HIGH'] ?? 0} color="#f0883e" />
           <StatCard icon="⚠️" label="Medium" value={bySeverity['SeverityLevel.MEDIUM'] ?? bySeverity['MEDIUM'] ?? 0} color="#d29922" />
@@ -263,7 +401,13 @@ export default function App() {
         {/* ── ROW 2: Timeline + Pie ── */}
         <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
           <div className="card">
-            <p className="card-title">📈 Alert Timeline (last 10 min)</p>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <p className="card-title" style={{ margin: 0 }}>📈 Alert Timeline {timelineOffset > 0 ? `(—${timelineOffset} min)` : '(live)'}</p>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button onClick={() => setTimelineOffset(o => o + 10)} style={{ background: 'var(--bg-card2)', color: 'var(--text-secondary)', border: '1px solid var(--border)', borderRadius: 4, cursor: 'pointer', padding: '2px 8px', fontSize: 11 }}>◁ 10m</button>
+                <button onClick={() => setTimelineOffset(0)} disabled={timelineOffset === 0} style={{ background: 'var(--bg-card2)', color: timelineOffset === 0 ? 'var(--text-dim)' : '#388bfd', border: '1px solid var(--border)', borderRadius: 4, cursor: timelineOffset === 0 ? 'not-allowed' : 'pointer', padding: '2px 8px', fontSize: 11 }}>Live ▷</button>
+              </div>
+            </div>
             <ResponsiveContainer width="100%" height={180}>
               <AreaChart data={timeline}>
                 <defs>
@@ -301,7 +445,7 @@ export default function App() {
         {/* ── ROW 3: MITRE heatmap + Top IPs ── */}
         <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
           <div className="card">
-            <p className="card-title">🗺️ MITRE ATT&CK Tactics (24h)</p>
+            <p className="card-title">🗺️ MITRE ATT&CK Tactics (All Time)</p>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               {byTactic.length === 0
                 ? <p style={{ color: 'var(--text-dim)' }}>No MITRE data yet</p>
@@ -345,7 +489,10 @@ export default function App() {
                   <Badge sev={a.severity?.replace('SeverityLevel.', '')} />
                   <span style={{ fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.title}</span>
                   <span className="mono" style={{ fontSize: 12, color: '#39d0d8' }}>{a.attack_type}</span>
-                  <span className="mono" style={{ fontSize: 12 }}>{a.src_ip}</span>
+                  <span className="mono" style={{ fontSize: 12, color: a.is_blocked ? '#f85149' : 'inherit' }}>
+                    {a.is_blocked && <span style={{ marginRight: 4 }}>🚫</span>}
+                    <span style={{ textDecoration: a.is_blocked ? 'line-through' : 'none' }}>{a.src_ip}</span>
+                  </span>
                   <span style={{ color: 'var(--text-secondary)', fontSize: 12 }}>{fmt(a.created_at)}</span>
                 </div>
               ))
@@ -358,19 +505,25 @@ export default function App() {
           <div className="card" style={{ borderColor: sev(selected.severity?.replace('SeverityLevel.', '')) + '44' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
               <p style={{ fontWeight: 700, fontSize: 15 }}>🔍 Alert Detail — #{selected.id}</p>
-              <button onClick={() => setSelected(null)} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 18 }}>✕</button>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                <button onClick={() => handleUnblockIP(selected.id, selected.src_ip)} style={{ background: '#3fb95020', color: '#3fb950', border: '1px solid #3fb950', borderRadius: 6, padding: '4px 12px', cursor: 'pointer', fontWeight: 600 }}>🟢 Unblock IP</button>
+                <button onClick={() => handleBlockIP(selected.id, selected.src_ip)} style={{ background: '#f8514920', color: '#f85149', border: '1px solid #f85149', borderRadius: 6, padding: '4px 12px', cursor: 'pointer', fontWeight: 600 }}>🛑 Block IP</button>
+                <button onClick={() => setSelected(null)} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 18 }}>✕</button>
+              </div>
             </div>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
               {[
                 ['Title', selected.title],
                 ['Severity', <Badge sev={selected.severity?.replace('SeverityLevel.', '')} />],
                 ['Attack Type', selected.attack_type],
-                ['Source IP', selected.src_ip],
+                ['Source IP', <span style={{ color: selected.is_blocked ? '#f85149' : 'inherit' }}>{selected.is_blocked && '🚫 '}<span style={{ textDecoration: selected.is_blocked ? 'line-through' : 'none' }}>{selected.src_ip}</span>{selected.ip_country ? ` ${getFlag(selected.ip_country)} ${selected.ip_country}` : ''}</span>],
+                ['ISP / Org', selected.ip_isp || '—'],
+                ['Abuse Score', selected.ip_abuse_score !== null && selected.ip_abuse_score !== undefined ? `${selected.ip_abuse_score}/100` : '—'],
                 ['MITRE Technique', selected.mitre_technique_id || '—'],
                 ['Confidence', selected.confidence ? `${(selected.confidence * 100).toFixed(1)}%` : '—'],
                 ['Detected At', fmtFull(selected.created_at)],
-              ].map(([k, v]) => (
-                <div key={k} style={{ background: 'var(--bg-card2)', borderRadius: 8, padding: '12px 14px' }}>
+              ].map(([k, v], i) => (
+                <div key={i} style={{ background: 'var(--bg-card2)', borderRadius: 8, padding: '12px 14px' }}>
                   <p style={{ color: 'var(--text-dim)', fontSize: 11, textTransform: 'uppercase', letterSpacing: '.05em', marginBottom: 4 }}>{k}</p>
                   <p className="mono" style={{ fontSize: 13, color: 'var(--text-primary)', fontWeight: 500 }}>{v}</p>
                 </div>
@@ -378,13 +531,13 @@ export default function App() {
             </div>
           </div>
         )}
-
-        {/* ── footer ── */}
-        <p style={{ textAlign: 'center', color: 'var(--text-dim)', fontSize: 12, marginTop: 8 }}>
-          SentinelIQ · Threat Detector Dashboard · Auto-refresh every 5s ·
-          Backend: <span style={{ color: '#388bfd' }}>localhost:8000</span>
-        </p>
       </div>
+      )}
+
+      {/* ── footer ── */}
+      <p style={{ textAlign: 'center', color: 'var(--text-dim)', fontSize: 12, marginTop: 8 }}>
+        SentinelIQ · Threat Detector Dashboard · Auto-refresh every 5s · Backend: localhost:8000
+      </p>
     </div>
   );
 }

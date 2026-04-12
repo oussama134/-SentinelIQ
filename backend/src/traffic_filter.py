@@ -42,7 +42,17 @@ WHITELIST_IP_PREFIXES = [
     "172.67.",    # Cloudflare
     "146.75.",    # Fastly
     "151.101.",   # Fastly
+    # --- NOISE FILTER ---
+    "192.168.1.", # Real Physical Local Wi-Fi network (Home Router / PC)
 ]
+
+DYNAMIC_WHITELIST = set()
+
+def update_trusted_ips_cache(ips):
+    global DYNAMIC_WHITELIST
+    DYNAMIC_WHITELIST.clear()
+    for ip in ips:
+        DYNAMIC_WHITELIST.add(ip)
 
 # ============================================================================
 # SINGLE is_benign_system_traffic — merged whitelist + port rules
@@ -59,9 +69,13 @@ def is_benign_system_traffic(flow_info: dict) -> bool:
     dst_port = flow_info.get('dst_port', 0)
     protocol = flow_info.get('protocol', '').upper()
 
-    # ── 1. CDN / Cloud whitelist ─────────────────────────────
-    for prefix in WHITELIST_IP_PREFIXES:
-        if src_ip.startswith(prefix) or dst_ip.startswith(prefix):
+    # ── 1. Check known CDN/DNS/Service subnets + DYNAMIC DB IPS
+    for pfx in WHITELIST_IP_PREFIXES:
+        if src_ip.startswith(pfx) or dst_ip.startswith(pfx):
+            return True
+            
+    for pfx in DYNAMIC_WHITELIST:
+        if src_ip.startswith(pfx) or dst_ip.startswith(pfx):
             return True
 
     # ── 2. DNS traffic ───────────────────────────────────────

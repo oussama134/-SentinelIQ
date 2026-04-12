@@ -196,7 +196,7 @@ def sim_windows_failed_login(ip=None, count=20):
 
 # ── 8. Nginx XSS Attempts ────────────────────────────────────────────────────
 def sim_nginx_xss(ip=None, count=12):
-    ip = ip or random.choice(ATTACKER_IPS)
+    ip = "141.98.10.33"
     payloads = [
         "/search?q=<script>alert('xss')</script>",
         "/comment?text=<img+src=x+onerror=alert(1)>",

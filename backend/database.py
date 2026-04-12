@@ -261,3 +261,17 @@ class BlockedIP(Base):
     alert_id = Column(Integer, ForeignKey("alerts.id"))
     is_active = Column(Boolean, default=True)
     expires_at = Column(DateTime, nullable=True)
+
+
+# ============================================================
+# TABLE: trusted_ips
+# IPs dynamically whitelisted by analysts
+# ============================================================
+class TrustedIP(Base):
+    __tablename__ = "trusted_ips"
+
+    id = Column(Integer, primary_key=True)
+    ip_prefix = Column(String(45), unique=True, nullable=False)
+    description = Column(String(200))
+    added_at = Column(DateTime, default=datetime.utcnow)
+    added_by = Column(String(100), default="Admin")

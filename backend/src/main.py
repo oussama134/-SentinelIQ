@@ -35,13 +35,51 @@ from database import init_db, AsyncSessionLocal, NormalizedLog, Alert, SeverityL
 from core.ingestion import pipeline as ingestion_pipeline
 from core.correlation import engine as correlation_engine
 from core.mitre import get_mitre_mapping
+from core.mitre import get_mitre_mapping
+from core.threat_intel import threat_intel
+
+# ── SMTP / Background ──────────────────────────────────────────
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from fastapi import BackgroundTasks
+
+def send_alert_email(alert_data: Alert, ip_country: str):
+    if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
+        return
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = settings.SMTP_USER
+        msg['To'] = settings.SMTP_USER
+        msg['Subject'] = f"🚨 CRITICAL ALERT: {alert_data.attack_type} detected!"
+        
+        html = f"""
+        <html><body>
+          <h2 style='color: #f85149;'>SentinelIQ Critical Attack Detected 🚨</h2>
+          <p><strong>Title:</strong> {alert_data.title}</p>
+          <p><strong>Attack Type:</strong> {alert_data.attack_type}</p>
+          <p><strong>Source IP:</strong> {alert_data.src_ip} {ip_country}</p>
+          <p><strong>Confidence:</strong> {str(alert_data.confidence)}</p>
+          <p style='margin-top:20px; font-size:12px; color:gray;'>Action required on dashboard: http://localhost:3000</p>
+        </body></html>
+        """
+        msg.attach(MIMEText(html, 'html'))
+        
+        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
+        server.starttls()
+        server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"[*] Critical Alert Email sent to {settings.SMTP_USER}")
+    except Exception as e:
+        print(f"[!] Failed to send email: {str(e)}")
 
 # ── Paths ────────────────────────────────────────────────────
 _PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 MODELS_DIR      = os.path.join(_PROJECT_ROOT, "backend", "models")
 _DATA_DIR       = os.path.join(_PROJECT_ROOT, "data")
 PCAP_PATH       = os.path.join(_DATA_DIR, "live_traffic.pcap")
-CAPTURE_INTERFACE = os.getenv("NETWORK_INTERFACE", "2")
+CAPTURE_INTERFACE = "4"
 CAPTURE_DURATION  = 5    # seconds — reduced for faster detection
 CAPTURE_COOLDOWN  = 0    # no pause between captures
 
@@ -49,7 +87,7 @@ CAPTURE_COOLDOWN  = 0    # no pause between captures
 app = FastAPI(title="SentinelIQ", version="5.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -73,7 +111,7 @@ def run_async(coro):
         return loop.run_until_complete(coro)
 
 # ── Predictor ─────────────────────────────────────────────────
-pred = Predictor(MODELS_DIR, confidence_threshold=0.85)
+pred = Predictor(MODELS_DIR, confidence_threshold=0.65)
 
 # ── Global state ──────────────────────────────────────────────
 history_lock    = Lock()
@@ -105,8 +143,9 @@ def capture_thread():
                 r"C:\Program Files\Wireshark\tshark.exe",
                 "-i", CAPTURE_INTERFACE,
                 "-a", f"duration:{CAPTURE_DURATION}",
+                "-c", "50000",
                 "-F", "pcap",
-                "-w", pcap_file,
+                "-w", pcap_file
             ], check=True, timeout=CAPTURE_DURATION + 5, capture_output=True)
 
             if not _pcap_queue.full():
@@ -227,6 +266,7 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log):
         await db_session.flush()
 
         for alert_data in triggered_alerts:
+            enrichment = await threat_intel.enrich_ip(alert_data.src_ip)
             db_alert = Alert(
                 title=alert_data.title,
                 description=alert_data.description,
@@ -239,9 +279,17 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log):
                 mitre_tactic=alert_data.mitre_tactic,
                 mitre_technique_id=alert_data.mitre_technique_id,
                 mitre_technique_name=alert_data.mitre_technique_name,
+                ip_country=enrichment.country_code,
+                ip_isp=enrichment.isp,
+                ip_abuse_score=enrichment.abuse_score,
+                is_known_malicious=enrichment.is_known_malicious,
                 raw_log_id=db_log.id,
             )
             db_session.add(db_alert)
+            
+            # Send Email if Critical
+            if db_alert.severity == SeverityLevel.CRITICAL:
+                Thread(target=send_alert_email, args=(db_alert, enrichment.country_code or ''), daemon=True).start()
 
         await db_session.commit()
 
@@ -352,6 +400,7 @@ def _rule_based_detect(flow_metadata: list, ts: str):
                 sev_map = {"LOW": SeverityLevel.LOW, "MEDIUM": SeverityLevel.MEDIUM,
                            "HIGH": SeverityLevel.HIGH, "CRITICAL": SeverityLevel.CRITICAL}
                 for a in rb_alerts:
+                    enrichment = await threat_intel.enrich_ip(a["src_ip"])
                     row = Alert(
                         title=a["title"],
                         severity=sev_map.get(a["severity"], SeverityLevel.MEDIUM),
@@ -361,11 +410,19 @@ def _rule_based_detect(flow_metadata: list, ts: str):
                         mitre_technique_id=a["mitre_technique_id"],
                         mitre_tactic=a.get("mitre_tactic", ""),
                         mitre_technique_name=a.get("mitre_technique_name", ""),
+                        ip_country=enrichment.country_code,
+                        ip_isp=enrichment.isp,
+                        ip_abuse_score=enrichment.abuse_score,
+                        is_known_malicious=enrichment.is_known_malicious,
                         status=AlertStatus.NEW,       # ← fixed: was OPEN
-                        is_known_malicious=False,
                         created_at=_dt.utcnow(),
                     )
                     session.add(row)
+                    
+                    # TRIGGER EMAIL FOR CRITICAL ALERTS FROM RULE BASED ENGINE
+                    if row.severity == SeverityLevel.CRITICAL:
+                        Thread(target=send_alert_email, args=(row, enrichment.country_code or ''), daemon=True).start()
+                        
                     traffic_stats.record_alert()
                     print(f"[{ts}] 🚨 RB-ALERT: {a['title']} | {a['severity']}")
                 await session.commit()
@@ -443,6 +500,7 @@ async def _evaluate_and_save_log_event(event) -> bool:
 
     try:
         async with AsyncSessionLocal() as session:
+            enrichment = await threat_intel.enrich_ip(event.src_ip)
             row = Alert(
                 title=title,
                 severity=sev_map.get(sev_str, SeverityLevel.MEDIUM),
@@ -453,8 +511,11 @@ async def _evaluate_and_save_log_event(event) -> bool:
                 mitre_technique_id=mitre_id,
                 mitre_tactic=mitre_tactic,
                 mitre_technique_name=mitre_name,
+                ip_country=enrichment.country_code,
+                ip_isp=enrichment.isp,
+                ip_abuse_score=enrichment.abuse_score,
+                is_known_malicious=enrichment.is_known_malicious,
                 status=AlertStatus.NEW,       # ← fixed: was OPEN
-                is_known_malicious=False,
                 created_at=_dt.utcnow(),
             )
             session.add(row)
@@ -561,13 +622,18 @@ async def log_sources():
 @app.get("/api/siem/alerts")
 async def siem_alerts(limit: int = Query(50, le=500)):
     from sqlalchemy import select, desc
-    from database import Alert as SiemAlert
+    from database import Alert as SiemAlert, BlockedIP
     try:
         async with AsyncSessionLocal() as s:
             result = await s.execute(
                 select(SiemAlert).order_by(desc(SiemAlert.id)).limit(limit)
             )
             alerts = result.scalars().all()
+            
+            # Fetch active blocked IPs
+            blocked_r = await s.execute(select(BlockedIP.ip_address))
+            blocked_set = {row[0] for row in blocked_r.all()}
+
         return {
             "alerts": [{
                 "id": a.id, "title": a.title, "severity": str(a.severity),
@@ -575,13 +641,60 @@ async def siem_alerts(limit: int = Query(50, le=500)):
                 "mitre_tactic": a.mitre_tactic, "mitre_technique_id": a.mitre_technique_id,
                 "mitre_technique_name": a.mitre_technique_name,
                 "is_known_malicious": a.is_known_malicious,
-                "ip_country": a.ip_country, "ip_abuse_score": a.ip_abuse_score,
-                "created_at": a.created_at.isoformat() if a.created_at else None,
+                "is_blocked": a.src_ip in blocked_set,
+                "ip_country": a.ip_country, "ip_isp": a.ip_isp, "ip_abuse_score": a.ip_abuse_score,
+                "created_at": a.created_at.isoformat() + "Z" if a.created_at else None,
             } for a in alerts],
             "total": len(alerts),
         }
     except Exception as e:
         return {"error": str(e), "alerts": []}
+
+
+@app.get("/api/siem/trusted-ips")
+async def get_trusted_ips():
+    from sqlalchemy import select
+    from database import TrustedIP
+    async with AsyncSessionLocal() as s:
+        result = await s.execute(select(TrustedIP))
+        ips = result.scalars().all()
+        # Update traffic_filter caching as a side-effect to ensure it's loaded
+        from traffic_filter import update_trusted_ips_cache
+        update_trusted_ips_cache([ip.ip_prefix for ip in ips])
+        return [{"id": ip.id, "ip_prefix": ip.ip_prefix, "description": ip.description, "added_at": ip.added_at.isoformat()} for ip in ips]
+
+class TrustedIPCreate(PydanticBase):
+    ip_prefix: str
+    description: str
+
+@app.post("/api/siem/trusted-ips")
+async def add_trusted_ip(data: TrustedIPCreate):
+    from database import TrustedIP
+    from sqlalchemy.exc import IntegrityError
+    try:
+        async with AsyncSessionLocal() as s:
+            # Truncate description to 200 chars max to prevent StringDataRightTruncationError in PG
+            desc = data.description[:199] if data.description else ""
+            new_ip = TrustedIP(ip_prefix=data.ip_prefix, description=desc)
+            s.add(new_ip)
+            await s.commit()
+        return {"success": True}
+    except IntegrityError:
+        # IP already exists, safe to ignore
+        return {"success": True, "message": "IP already trusted"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/siem/trusted-ips/{ip_id}")
+async def delete_trusted_ip(ip_id: int):
+    from sqlalchemy import delete
+    from database import TrustedIP
+    async with AsyncSessionLocal() as s:
+        await s.execute(delete(TrustedIP).where(TrustedIP.id == ip_id))
+        await s.commit()
+    return {"success": True}
 
 
 @app.get("/api/siem/dashboard")
@@ -590,14 +703,13 @@ async def siem_dashboard():
     from datetime import timedelta
     from database import Alert as SiemAlert
     try:
-        since = datetime.utcnow() - timedelta(hours=24)
         async with AsyncSessionLocal() as s:
-            total_r      = await s.execute(select(func.count(SiemAlert.id)).where(SiemAlert.created_at >= since))
-            severity_r   = await s.execute(select(SiemAlert.severity, func.count(SiemAlert.id)).where(SiemAlert.created_at >= since).group_by(SiemAlert.severity))
-            tactic_r     = await s.execute(select(SiemAlert.mitre_tactic, func.count(SiemAlert.id)).where(SiemAlert.created_at >= since).group_by(SiemAlert.mitre_tactic).order_by(desc(func.count(SiemAlert.id))))
-            top_ips_r    = await s.execute(select(SiemAlert.src_ip, func.count(SiemAlert.id)).where(SiemAlert.created_at >= since).group_by(SiemAlert.src_ip).order_by(desc(func.count(SiemAlert.id))).limit(10))
+            total_r      = await s.execute(select(func.count(SiemAlert.id)))
+            severity_r   = await s.execute(select(SiemAlert.severity, func.count(SiemAlert.id)).group_by(SiemAlert.severity))
+            tactic_r     = await s.execute(select(SiemAlert.mitre_tactic, func.count(SiemAlert.id)).group_by(SiemAlert.mitre_tactic).order_by(desc(func.count(SiemAlert.id))))
+            top_ips_r    = await s.execute(select(SiemAlert.src_ip, func.count(SiemAlert.id)).group_by(SiemAlert.src_ip).order_by(desc(func.count(SiemAlert.id))).limit(10))
         return {
-            "total_alerts_24h": total_r.scalar(),
+            "total_alerts":     total_r.scalar(),
             "by_severity":      {str(r[0]): r[1] for r in severity_r},
             "by_mitre_tactic":  [{"tactic": r[0], "count": r[1]} for r in tactic_r],
             "top_source_ips":   [{"ip": r[0], "count": r[1]} for r in top_ips_r],
@@ -619,7 +731,7 @@ async def get_alerts(limit: int = Query(50, ge=1, le=1000)):
             "alerts": [{"id": a.id, "title": a.title, "severity": str(a.severity),
                         "src_ip": a.src_ip, "attack_type": a.attack_type,
                         "confidence": a.confidence, "mitre_technique_id": a.mitre_technique_id,
-                        "created_at": a.created_at.isoformat() if a.created_at else None}
+                        "created_at": a.created_at.isoformat() + "Z" if a.created_at else None}
                        for a in alerts],
             "total": len(alerts),
         }
@@ -658,6 +770,79 @@ async def acknowledge_alert(alert_id: int):
         return {"success": True}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.post("/api/siem/alerts/{alert_id}/block")
+async def block_ip_from_alert(alert_id: int):
+    from sqlalchemy import select
+    from database import Alert as SiemAlert, BlockedIP, AlertStatus
+    try:
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(select(SiemAlert).where(SiemAlert.id == alert_id))
+            alert = result.scalar_one_or_none()
+            if not alert:
+                raise HTTPException(status_code=404, detail="Alert not found")
+            
+            ip = alert.src_ip
+            if ip in ("127.0.0.1", "localhost", "0.0.0.0", "multiple", "") or ip.startswith("192.168.56."):
+                raise HTTPException(status_code=400, detail="Cannot block internal/invalid IP")
+                
+            # Handle duplicate key if already blocked
+            existing_block = await s.execute(select(BlockedIP).where(BlockedIP.ip_address == ip))
+            if existing_block.scalar_one_or_none():
+                return {"success": True, "blocked_ip": ip, "firewall_status": "Already Blocked"}
+                
+            # Execute Windows Firewall block command via PowerShell
+            cmd = f'New-NetFirewallRule -DisplayName "SentinelIQ Block {ip}" -Direction Inbound -Action Block -RemoteAddress {ip}'
+            print(f"[*] Executing firewall block: {cmd}")
+            proc = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
+            
+            if proc.returncode != 0:
+                print(f"[!] Firewall block warning: {proc.stderr}")
+                
+            # Log the action
+            block_log = BlockedIP(
+                ip_address=ip,
+                reason=f"Blocked via Dashboard for Alert #{alert_id} ({alert.attack_type})",
+                blocked_by="Analyst",
+                alert_id=alert_id
+            )
+            s.add(block_log)
+            alert.status = AlertStatus.INVESTIGATING
+            await s.commit()
+            
+        return {"success": True, "blocked_ip": ip, "firewall_status": proc.stderr.strip() if proc.returncode != 0 else "OK"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/siem/alerts/{alert_id}/unblock")
+async def unblock_ip_from_alert(alert_id: int):
+    from sqlalchemy import select, delete
+    from database import Alert as SiemAlert, BlockedIP, AlertStatus
+    try:
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(select(SiemAlert).where(SiemAlert.id == alert_id))
+            alert = result.scalar_one_or_none()
+            if not alert:
+                raise HTTPException(status_code=404, detail="Alert not found")
+            
+            ip = alert.src_ip
+            
+            # Execute Windows Firewall unblock command via PowerShell
+            cmd = f'Remove-NetFirewallRule -DisplayName "SentinelIQ Block {ip}"'
+            print(f"[*] Executing firewall unblock: {cmd}")
+            proc = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
+            
+            # Remove from BlockedIP table
+            await s.execute(delete(BlockedIP).where(BlockedIP.ip_address == ip))
+            await s.commit()
+            
+        return {"success": True, "unblocked_ip": ip}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/set-threshold")
