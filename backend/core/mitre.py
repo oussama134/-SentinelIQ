@@ -174,6 +174,27 @@ MITRE_MAPPINGS: dict[str, MitreMapping] = {
         severity_base="MEDIUM"
     ),
 
+    "Path Traversal": MitreMapping(
+        attack_label="Path Traversal",
+        tactic="Discovery",
+        tactic_id="TA0007",
+        technique_id="T1083",
+        technique_name="File and Directory Discovery",
+        kill_chain_stage="Reconnaissance",
+        severity_base="HIGH"
+    ),
+
+    "Privilege Escalation": MitreMapping(
+        attack_label="Privilege Escalation",
+        tactic="Privilege Escalation",
+        tactic_id="TA0004",
+        technique_id="T1548",
+        technique_name="Abuse Elevation Control Mechanism",
+        sub_technique="T1548.003",
+        kill_chain_stage="Exploitation",
+        severity_base="HIGH"
+    ),
+
     "DDoS": MitreMapping(
         attack_label="DDoS",
         tactic="Impact",
@@ -187,14 +208,54 @@ MITRE_MAPPINGS: dict[str, MitreMapping] = {
 }
 
 
+# ── Event-type → MITRE for log-path and rule-based alerts (no ML label) ────
+# Correlation rules fire with event_type strings like "nginx_sql_injection".
+# get_mitre_mapping() only knows ML class names, so these returned T0000.
+# This table maps every rule event_type to the correct technique.
+EVENT_TYPE_MAPPINGS: dict[str, str] = {
+    # Nginx log events
+    "nginx_sql_injection":  "Web Attack – Sql Injection",
+    "nginx_xss_attempt":    "Web Attack – XSS",
+    "nginx_scanner_ua":     "PortScan",
+    "nginx_4xx":            "PortScan",
+    # Auth / SSH log events
+    "auth_root_login":      "SSH-Patator",
+    "ssh_failed_login":     "SSH-Patator",
+    "ssh_invalid_user":     "SSH-Patator",
+    "failed_ssh":           "SSH-Patator",
+    # PCAP rule-based events
+    "ssh_brute_force":      "SSH-Patator",
+    "ftp_brute_force":      "FTP-Patator",
+    "port_scan":            "PortScan",
+    "ddos":                 "DDoS",
+    "dos_hulk":             "DoS Hulk",
+    "dos_slowloris":        "DoS slowloris",
+    "dos_goldeneye":        "DoS GoldenEye",
+    "dos_slowhttptest":     "DoS Slowhttptest",
+    "web_brute_force":      "Web Attack – Brute Force",
+    "sql_injection":        "Web Attack – Sql Injection",
+    "web_xss":              "Web Attack – XSS",
+    "botnet_activity":      "Bot",
+    "heartbleed_exploit":   "Heartbleed",
+    # New log-path event types
+    "nginx_path_traversal": "Path Traversal",
+    "sudo_privilege_esc":   "Privilege Escalation",
+    "syslog_security_event":"PortScan",                     # generic — no dedicated class for syslog events
+}
+
+
 def get_mitre_mapping(attack_label: str) -> MitreMapping:
     """
-    Get MITRE mapping for a model prediction label.
+    Get MITRE mapping for a model prediction label or correlation event_type.
     Handles minor label variations (case, spacing, dashes).
     """
-    # Direct match
+    # Direct match against ML class names
     if attack_label in MITRE_MAPPINGS:
         return MITRE_MAPPINGS[attack_label]
+
+    # Direct match against rule event_type strings
+    if attack_label in EVENT_TYPE_MAPPINGS:
+        return MITRE_MAPPINGS[EVENT_TYPE_MAPPINGS[attack_label]]
 
     # Fuzzy match — handle label variations from different datasets
     label_lower = attack_label.lower().strip()

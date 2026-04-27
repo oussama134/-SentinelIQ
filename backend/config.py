@@ -58,12 +58,22 @@ class Settings(BaseSettings):
     SMTP_USER: str = ""
     SMTP_PASSWORD: str = ""
 
+    # Remote response (Ubuntu victim firewall)
+    REMOTE_RESPONSE_ENABLED: bool = False
+    REMOTE_RESPONSE_HOST: str = ""
+    REMOTE_RESPONSE_PORT: int = 22
+    REMOTE_RESPONSE_USER: str = ""
+    REMOTE_RESPONSE_IDENTITY_FILE: str = ""
+    REMOTE_RESPONSE_BACKEND: str = "iptables"   # iptables | ufw
+    REMOTE_RESPONSE_USE_SUDO: bool = True
+
     # AI Agent
     OLLAMA_HOST: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3"
 
     class Config:
-        env_file = ".env"
+        import os
+        env_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
         case_sensitive = True
 
 

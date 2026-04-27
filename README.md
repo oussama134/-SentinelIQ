@@ -44,9 +44,9 @@ cd backend/src
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 > **Note on Interfaces:** To change what network interface SentinelIQ sniffs on, edit `CAPTURE_INTERFACE` inside `backend/src/main.py`. 
-> - For Wi-Fi: `CAPTURE_INTERFACE = "4"`
+> - For Wi-Fi: `CAPTURE_INTERFACE = "4"`  
 > - For Host-Only VirtualBox / Ethernet: `CAPTURE_INTERFACE = "7"`
-
+  
 ### 3. Launch the Frontend Dashboard
 Open a new terminal, and start the React app:
 ```bash

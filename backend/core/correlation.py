@@ -19,19 +19,20 @@ from core.mitre import get_mitre_mapping
 # ============================================================
 CLASS_THRESHOLDS: dict[str, float] = {
     "BENIGN":                       0.50,
-    "DoS slowloris":                0.85,   # High threshold = less false positives
-    "DoS Slowhttptest":             0.85,
-    "DoS Hulk":                     0.82,
-    "DoS GoldenEye":                0.82,
-    "DDoS":                         0.80,
-    "FTP-Patator":                  0.70,
-    "SSH-Patator":                  0.70,
-    "PortScan":                     0.72,
+    "DoS slowloris":                0.72,
+    "DoS Slowhttptest":             0.72,
+    "DoS Hulk":                     0.70,
+    "DoS GoldenEye":                0.70,
+    "DDoS":                         0.55,
+
+    "FTP-Patator":                  0.72,
+    "SSH-Patator":                  0.72,
+    "PortScan":                     0.78,
     "Bot":                          0.75,
-    "Heartbleed":                   0.78,
-    "Web Attack – Brute Force":     0.68,
-    "Web Attack – XSS":             0.68,
-    "Web Attack – Sql Injection":   0.75,
+    "Heartbleed":                   0.82,
+    "Web Attack – Brute Force":     0.72,
+    "Web Attack – XSS":             0.72,
+    "Web Attack – Sql Injection":   0.80,
     "Infiltration":                 0.80,
 }
 
@@ -59,26 +60,26 @@ DEFAULT_RULES: list[Rule] = [
         rule_id="R001",
         name="SSH Brute Force Detected",
         event_type="ssh_brute_force",
-        count_threshold=5,
+        count_threshold=1,
         window_seconds=60,
         severity="HIGH",
-        description="5+ SSH brute force flows from same IP within 60 seconds",
+        description="SSH brute force flows detected from same IP",
         mitre_technique_id="T1110.001",
     ),
     Rule(
         rule_id="R002",
         name="FTP Brute Force Detected",
         event_type="ftp_brute_force",
-        count_threshold=5,
+        count_threshold=1,
         window_seconds=60,
         severity="HIGH",
-        description="5+ FTP brute force flows from same IP within 60 seconds",
+        description="FTP brute force flows detected from same IP",
         mitre_technique_id="T1110.001",
     ),
     Rule(
         rule_id="R003",
         name="DoS Attack Detected",
-        event_type="dos_hulk",          # Will also match slowloris, goldeneye via prefix
+        event_type="dos_hulk",          # Also matches dos_slowloris, dos_goldeneye via prefix
         count_threshold=3,
         window_seconds=60,
         severity="CRITICAL",
@@ -89,10 +90,10 @@ DEFAULT_RULES: list[Rule] = [
         rule_id="R004",
         name="Port Scan Detected",
         event_type="port_scan",
-        count_threshold=10,
+        count_threshold=1,
         window_seconds=60,
         severity="MEDIUM",
-        description="Port scan — 10+ probe flows in 60 seconds",
+        description="Port scan detected — rule-based layer already validated 30+ unique ports",
         mitre_technique_id="T1046",
     ),
     Rule(
@@ -138,7 +139,7 @@ DEFAULT_RULES: list[Rule] = [
     Rule(
         rule_id="R009",
         name="Failed SSH Login Spike",
-        event_type="failed_ssh",       # From auth.log
+        event_type="ssh_failed_login",  # auth.log via AuthLogParser
         count_threshold=5,
         window_seconds=60,
         severity="HIGH",
@@ -159,11 +160,175 @@ DEFAULT_RULES: list[Rule] = [
         rule_id="R011",
         name="DDoS Attack Detected",
         event_type="ddos",
-        count_threshold=1,              # Alert on first DDoS flow detected
+        count_threshold=1,
         window_seconds=60,
         severity="CRITICAL",
         description="DDoS traffic detected by ML model",
         mitre_technique_id="T1498",
+    ),
+
+    # ── Rules for log_collector.py event types (auth.log forwarded from Ubuntu) ──
+
+    Rule(
+        rule_id="R012",
+        name="Root Login Attempt",
+        event_type="auth_root_login",
+        count_threshold=1,          # Fire immediately on first occurrence
+        window_seconds=1,
+        severity="CRITICAL",
+        description="SSH root login attempt detected in auth.log",
+        mitre_technique_id="T1110.001",
+    ),
+    Rule(
+        rule_id="R013",
+        name="SSH Brute Force (auth.log)",
+        event_type="ssh_failed_login",
+        count_threshold=3,          # 3 failures in 60s — low for testing
+        window_seconds=60,
+        severity="HIGH",
+        description="3+ SSH login failures in 60 seconds from auth.log",
+        mitre_technique_id="T1110",
+    ),
+    Rule(
+        rule_id="R014",
+        name="SSH Invalid User Probe",
+        event_type="ssh_invalid_user",
+        count_threshold=3,
+        window_seconds=60,
+        severity="MEDIUM",
+        description="3+ SSH invalid-user attempts from same IP",
+        mitre_technique_id="T1110.001",
+    ),
+
+    # ── Rules for log_collector.py NginxLogParser event types ──
+
+    Rule(
+        rule_id="R015",
+        name="SQL Injection (Nginx log)",
+        event_type="nginx_sql_injection",
+        count_threshold=1,
+        window_seconds=1,
+        severity="CRITICAL",
+        description="SQL injection pattern detected in Nginx access log",
+        mitre_technique_id="T1190",
+    ),
+    Rule(
+        rule_id="R016",
+        name="XSS Attempt (Nginx log)",
+        event_type="nginx_xss_attempt",
+        count_threshold=1,
+        window_seconds=1,
+        severity="HIGH",
+        description="XSS payload detected in Nginx access log",
+        mitre_technique_id="T1189",
+    ),
+    Rule(
+        rule_id="R017",
+        name="Web Scanner Detected",
+        event_type="nginx_scanner_ua",
+        count_threshold=1,
+        window_seconds=1,
+        severity="HIGH",
+        description="Attack tool User-Agent detected (sqlmap, nikto, hydra…)",
+        mitre_technique_id="T1046",
+    ),
+    Rule(
+        rule_id="R018",
+        name="Web Scanning / Probing",
+        event_type="nginx_4xx",
+        count_threshold=15,
+        window_seconds=30,
+        severity="MEDIUM",
+        description="15+ HTTP 4xx errors in 30 seconds — directory/path probing",
+        mitre_technique_id="T1046",
+    ),
+
+    # ── Rules for syslog and new nginx event types ──
+
+    Rule(
+        rule_id="R019",
+        name="Path Traversal Attempt",
+        event_type="nginx_path_traversal",
+        count_threshold=1,
+        window_seconds=1,
+        severity="HIGH",
+        description="Directory traversal pattern detected in HTTP request (../etc/passwd, %2e%2e…)",
+        mitre_technique_id="T1083",
+    ),
+    Rule(
+        rule_id="R020",
+        name="Privilege Escalation via Sudo",
+        event_type="sudo_privilege_esc",
+        count_threshold=1,
+        window_seconds=1,
+        severity="HIGH",
+        description="Sudo command executed — possible privilege escalation",
+        mitre_technique_id="T1548.003",
+    ),
+    Rule(
+        rule_id="R021",
+        name="System Security Event (syslog)",
+        event_type="syslog_security_event",
+        count_threshold=3,
+        window_seconds=60,
+        severity="MEDIUM",
+        description="3+ syslog security events in 60 seconds (UFW blocks, service failures, denied access)",
+        mitre_technique_id="T1562",
+    ),
+
+    # ── LOW severity — early-warning reconnaissance indicators ──────────────────
+    # These fire before thresholds for higher-severity rules are crossed,
+    # giving analysts an early signal that an attack chain may be starting.
+
+    Rule(
+        rule_id="R025",
+        name="First SSH Login Failure",
+        event_type="ssh_failed_login",
+        count_threshold=1,
+        window_seconds=1,
+        severity="LOW",
+        description="First SSH authentication failure from this IP — possible brute force starting",
+        mitre_technique_id="T1110",
+    ),
+    Rule(
+        rule_id="R026",
+        name="First Invalid SSH Username",
+        event_type="ssh_invalid_user",
+        count_threshold=1,
+        window_seconds=1,
+        severity="LOW",
+        description="SSH attempt with non-existent username — possible user enumeration",
+        mitre_technique_id="T1110.001",
+    ),
+    Rule(
+        rule_id="R027",
+        name="Low-Rate HTTP Probing",
+        event_type="nginx_4xx",
+        count_threshold=3,
+        window_seconds=60,
+        severity="LOW",
+        description="3–14 HTTP 4xx errors in 60 seconds — low-rate web directory probing",
+        mitre_technique_id="T1046",
+    ),
+    Rule(
+        rule_id="R028",
+        name="Single FTP Login Failure",
+        event_type="ftp_brute_force",
+        count_threshold=1,
+        window_seconds=1,
+        severity="LOW",
+        description="Single FTP authentication failure — may indicate credential testing",
+        mitre_technique_id="T1110.001",
+    ),
+    Rule(
+        rule_id="R029",
+        name="Suspicious Syslog Event",
+        event_type="syslog_security_event",
+        count_threshold=1,
+        window_seconds=1,
+        severity="LOW",
+        description="Single syslog security event — UFW block, auth denial, or service failure",
+        mitre_technique_id="T1562",
     ),
 ]
 
@@ -184,6 +349,7 @@ class TriggeredAlert:
     mitre_technique_name: str = ""
     dst_ip: Optional[str] = None
     dst_port: Optional[int] = None
+    extra: dict = field(default_factory=dict)
 
     @property
     def title(self) -> str:
@@ -241,7 +407,7 @@ class CorrelationEngine:
 
     def __init__(self, rules: list[Rule] = None):
         self.rules = {r.rule_id: r for r in (rules or DEFAULT_RULES)}
-        self.suppressor = AlertSuppressor(cooldown_seconds=30)  # 30s for testing (was 300s)
+        self.suppressor = AlertSuppressor(cooldown_seconds=60)
 
         # event_type → src_ip → [timestamps]
         self._event_counts: dict[str, dict[str, list[float]]] = defaultdict(
@@ -303,6 +469,7 @@ class CorrelationEngine:
                     mitre_technique_name=mitre.technique_name,
                     dst_ip=log.dst_ip,
                     dst_port=log.dst_port,
+                    extra=log.extra,
                 )
 
                 alerts.append(alert)

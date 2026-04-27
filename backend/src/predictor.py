@@ -4,6 +4,11 @@ import os
 import joblib
 import torch
 import numpy as np
+import warnings
+# Filter specific sklearn warning about unpickling versions (1.7.2 -> 1.8.0)
+from sklearn.exceptions import InconsistentVersionWarning
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+
 from lstm_model import LSTMModel
 
 class Predictor:
@@ -38,8 +43,8 @@ class Predictor:
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model.eval()
         
-        print(f"✅ Model loaded: {num_classes} classes, {input_dim} features")
-        print(f"🎯 Confidence threshold: {confidence_threshold:.2f}")
+        print(f"[OK] Model loaded: {num_classes} classes, {input_dim} features")
+        print(f"[*]  Confidence threshold: {confidence_threshold:.2f}")
     
     def predict_df(self, df):
         """Original method - returns only labels"""
@@ -113,9 +118,9 @@ class Predictor:
                                if label.upper() != "BENIGN" and score < self.confidence_threshold)
             
             if filtered_count > 0:
-                print(f"   ℹ️  Filtered {filtered_count} low-confidence predictions (< {self.confidence_threshold:.2f})")
+                print(f"   [~] Filtered {filtered_count} low-confidence predictions (< {self.confidence_threshold:.2f})")
             
-            print(f"✅ Predicted {len(results)} sequences")
+            print(f"[OK] Predicted {len(results)} sequences")
             return results
             
         except Exception as e:
@@ -131,7 +136,7 @@ class Predictor:
         
         old_threshold = self.confidence_threshold
         self.confidence_threshold = threshold
-        print(f"🎯 Confidence threshold updated: {old_threshold:.2f} → {threshold:.2f}")
+        print(f"[*] Confidence threshold updated: {old_threshold:.2f} -> {threshold:.2f}")
     
     def get_prediction_stats(self, results):
         """Get statistics about predictions"""

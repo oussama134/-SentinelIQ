@@ -40,7 +40,7 @@ def pcap_to_flows_with_metadata(pcap_path: str):
         'protocol': 'OTHER'
     })
     
-    for pkt in tqdm(packets, desc="Grouping packets", leave=False):
+    for pkt in tqdm(packets, desc="Grouping packets", leave=False, disable=len(packets) > 5000):
         if IP not in pkt:
             continue
         
@@ -83,7 +83,7 @@ def pcap_to_flows_with_metadata(pcap_path: str):
     feature_rows = []
     metadata_list = []
     
-    for key, flow_data in tqdm(flows.items(), desc="Extracting features", leave=False):
+    for key, flow_data in tqdm(flows.items(), desc="Extracting features", leave=False, disable=len(flows) > 1000):
         dst_ip = flow_data["dst_ip"]
         if dst_ip.startswith(("224.", "239.", "255.")):
             continue

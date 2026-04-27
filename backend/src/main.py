@@ -5,11 +5,18 @@ import subprocess
 import time
 import json
 import queue
-from datetime import datetime
+import ipaddress
+import ctypes
+import pandas as pd
+from datetime import datetime, timedelta
 from threading import Thread, Lock
 from collections import Counter, defaultdict
 
-from fastapi import FastAPI, HTTPException, Query
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
+warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel as PydanticBase
@@ -27,6 +34,7 @@ from traffic_filter import (
     post_process_prediction,
     should_generate_alert,
     TrafficStats,
+    active_defense,
 )
 
 # ── SIEM imports ─────────────────────────────────────────────
@@ -34,9 +42,10 @@ from config import settings
 from database import init_db, AsyncSessionLocal, NormalizedLog, Alert, SeverityLevel
 from core.ingestion import pipeline as ingestion_pipeline
 from core.correlation import engine as correlation_engine
-from core.mitre import get_mitre_mapping
-from core.mitre import get_mitre_mapping
+from core.mitre import get_mitre_mapping, EVENT_TYPE_MAPPINGS
 from core.threat_intel import threat_intel
+from core.active_defense import active_defense
+
 
 # ── SMTP / Background ──────────────────────────────────────────
 import smtplib
@@ -51,11 +60,11 @@ def send_alert_email(alert_data: Alert, ip_country: str):
         msg = MIMEMultipart()
         msg['From'] = settings.SMTP_USER
         msg['To'] = settings.SMTP_USER
-        msg['Subject'] = f"🚨 CRITICAL ALERT: {alert_data.attack_type} detected!"
+        msg['Subject'] = f"[ALERT] CRITICAL ALERT: {alert_data.attack_type} detected!"
         
         html = f"""
         <html><body>
-          <h2 style='color: #f85149;'>SentinelIQ Critical Attack Detected 🚨</h2>
+          <h2 style='color: #f85149;'>SentinelIQ Critical Attack Detected [ALERT]</h2>
           <p><strong>Title:</strong> {alert_data.title}</p>
           <p><strong>Attack Type:</strong> {alert_data.attack_type}</p>
           <p><strong>Source IP:</strong> {alert_data.src_ip} {ip_country}</p>
@@ -79,8 +88,8 @@ _PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 MODELS_DIR      = os.path.join(_PROJECT_ROOT, "backend", "models")
 _DATA_DIR       = os.path.join(_PROJECT_ROOT, "data")
 PCAP_PATH       = os.path.join(_DATA_DIR, "live_traffic.pcap")
-CAPTURE_INTERFACE = "4"
-CAPTURE_DURATION  = 5    # seconds — reduced for faster detection
+CAPTURE_INTERFACE = os.getenv("SENTINELIQ_CAPTURE_INTERFACE", "7")  # Ethernet 2 = VirtualBox 192.168.56.x
+CAPTURE_DURATION  = 10    # seconds — reduced for faster detection
 CAPTURE_COOLDOWN  = 0    # no pause between captures
 
 # ── FastAPI app ───────────────────────────────────────────────
@@ -94,13 +103,45 @@ app.add_middleware(
 
 import asyncio
 main_loop = None
+_remote_callbacks_registered = False
 
 @app.on_event("startup")
 async def startup_event():
-    global main_loop
+    global main_loop, _remote_callbacks_registered
     main_loop = asyncio.get_running_loop()
-    await init_db()
-    print("✅ PostgreSQL initialisé (async on uvicorn loop)")
+    try:
+        await init_db()
+        print("[OK] PostgreSQL initialisé (async on uvicorn loop)")
+    except Exception as _db_err:
+        print(f"[!] PostgreSQL unavailable: {_db_err}")
+        print("[!] Start the database with:  docker-compose up -d postgres")
+    
+    if _remote_response_enabled():
+        if not _remote_callbacks_registered:
+            active_defense.register_ip_ban_callback(_remote_ban_callback)
+            active_defense.register_ip_unban_callback(_remote_unban_callback)
+            _remote_callbacks_registered = True
+        print(
+            f"[*] Remote response enabled: "
+            f"{settings.REMOTE_RESPONSE_USER}@{settings.REMOTE_RESPONSE_HOST}:"
+            f"{settings.REMOTE_RESPONSE_PORT} via {settings.REMOTE_RESPONSE_BACKEND}"
+        )
+
+    # Init the whitelist cache from DB immediately
+    await _load_trusted_ips_on_startup()
+
+async def _load_trusted_ips_on_startup():
+    from sqlalchemy import select
+    from database import TrustedIP
+    from traffic_filter import update_trusted_ips_cache
+    try:
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(select(TrustedIP))
+            ips = result.scalars().all()
+            update_trusted_ips_cache([ip.ip_prefix for ip in ips])
+            print(f"[OK] Loaded {len(ips)} trusted IP prefixes into memory cache")
+    except Exception as e:
+        print(f"[!] Startup Whitelist Load Error: {e}")
 
 def run_async(coro):
     """Submit a coroutine to the uvicorn event loop from any background thread."""
@@ -110,7 +151,178 @@ def run_async(coro):
         loop = asyncio.new_event_loop()
         return loop.run_until_complete(coro)
 
+
+def _ban_ip_safely(ip: str, attack_type: str, reason: str):
+    """Keep active defense failures from breaking alert persistence."""
+    try:
+        active_defense.ban_ip(ip, reason=reason, attack_type=attack_type)
+    except Exception as e:
+        print(f"[!] Active defense IP ban failed for {ip}: {e}")
+
+
+def _ban_user_agent_safely(user_agent: str, attack_type: str, reason: str):
+    """Keep active defense failures from breaking alert persistence."""
+    if not user_agent:
+        return
+    try:
+        active_defense.ban_user_agent(user_agent, reason=reason, attack_type=attack_type)
+    except Exception as e:
+        print(f"[!] Active defense UA ban failed: {e}")
+
+
+def _is_blockable_ip(ip: str) -> bool:
+    if not ip or ip in {"0.0.0.0", "localhost", "multiple"}:
+        return False
+    return not ip.startswith("127.")
+
+
+def _firewall_rule_name(ip: str) -> str:
+    return f"SentinelIQ Auto Block {ip}"
+
+
+def _is_running_as_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+_RUNNING_AS_ADMIN: bool = _is_running_as_admin()
+if not _RUNNING_AS_ADMIN:
+    print("[!] WARNING: SentinelIQ is NOT running as Administrator.")
+    print("[!] Windows Firewall auto-blocking (New-NetFirewallRule) will fail with 'Access Denied (System Error 5)'.")
+    print("[!] Fix: right-click your terminal → 'Run as administrator', then restart the backend.")
+
+
+def _apply_windows_firewall_block(ip: str) -> bool:
+    """Best-effort host firewall block for the SentinelIQ machine itself."""
+    if not _is_blockable_ip(ip):
+        return False
+
+    if not _RUNNING_AS_ADMIN:
+        print(f"[!] Windows Firewall skip (no admin) for {ip} — restart backend as Administrator to enable")
+        return False
+
+    rule_name = _firewall_rule_name(ip)
+    cmd = (
+        f'New-NetFirewallRule -DisplayName "{rule_name}" '
+        f'-Direction Inbound -Action Block -RemoteAddress {ip}'
+    )
+    proc = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
+    stderr = (proc.stderr or "").strip().lower()
+    if proc.returncode == 0 or "already exists" in stderr or "cannot create a file when that file already exists" in stderr:
+        print(f"[*] Windows Firewall block active for {ip}")
+        return True
+
+    if "access is denied" in stderr or "system error 5" in stderr:
+        print(f"[!] Windows Firewall denied for {ip} — backend must run as Administrator")
+    else:
+        print(f"[!] Windows Firewall auto-block failed for {ip}: {(proc.stderr or proc.stdout).strip()}")
+    return False
+
+
+async def _upsert_blocked_ip_record(session, ip: str, reason: str, alert_id: int | None = None, ttl_seconds: int = 600):
+    """Persist auto-block state so the dashboard can display it."""
+    if not _is_blockable_ip(ip):
+        return
+
+    from sqlalchemy import select
+    from database import BlockedIP
+
+    expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    result = await session.execute(select(BlockedIP).where(BlockedIP.ip_address == ip))
+    row = result.scalar_one_or_none()
+
+    if row:
+        row.reason = reason[:200]
+        row.blocked_by = "AUTO"
+        row.is_active = True
+        row.expires_at = expires_at
+        if alert_id:
+            row.alert_id = alert_id
+        return
+
+    session.add(BlockedIP(
+        ip_address=ip,
+        reason=reason[:200],
+        blocked_by="AUTO",
+        alert_id=alert_id,
+        is_active=True,
+        expires_at=expires_at,
+    ))
+
+
+def _remote_response_enabled() -> bool:
+    return bool(
+        settings.REMOTE_RESPONSE_ENABLED
+        and settings.REMOTE_RESPONSE_HOST
+        and settings.REMOTE_RESPONSE_USER
+    )
+
+
+def _build_remote_ubuntu_command(ip: str, action: str) -> str:
+    safe_ip = str(ipaddress.ip_address(ip))
+    sudo_prefix = "sudo -n " if settings.REMOTE_RESPONSE_USE_SUDO else ""
+    backend = (settings.REMOTE_RESPONSE_BACKEND or "iptables").strip().lower()
+
+    if backend == "ufw":
+        if action == "ban":
+            return (
+                f"{sudo_prefix}bash -lc "
+                f"\"ufw status | grep -F 'DENY IN    {safe_ip}' >/dev/null "
+                f"|| ufw insert 1 deny from {safe_ip}\""
+            )
+        return (
+            f"{sudo_prefix}bash -lc "
+            f"\"yes | ufw delete deny from {safe_ip} >/dev/null 2>&1 || true\""
+        )
+
+    if action == "ban":
+        return (
+            f"{sudo_prefix}bash -lc "
+            f"\"iptables -C INPUT -s {safe_ip} -j DROP 2>/dev/null "
+            f"|| iptables -I INPUT -s {safe_ip} -j DROP\""
+        )
+    return (
+        f"{sudo_prefix}bash -lc "
+        f"\"iptables -D INPUT -s {safe_ip} -j DROP 2>/dev/null || true\""
+    )
+
+
+def _run_remote_ubuntu_firewall_action(ip: str, action: str):
+    if not _remote_response_enabled() or not _is_blockable_ip(ip):
+        return
+
+    safe_ip = str(ipaddress.ip_address(ip))
+    ssh_cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-p", str(settings.REMOTE_RESPONSE_PORT),
+    ]
+    if settings.REMOTE_RESPONSE_IDENTITY_FILE:
+        ssh_cmd.extend(["-i", settings.REMOTE_RESPONSE_IDENTITY_FILE])
+    ssh_cmd.append(f"{settings.REMOTE_RESPONSE_USER}@{settings.REMOTE_RESPONSE_HOST}")
+    ssh_cmd.append(_build_remote_ubuntu_command(safe_ip, action))
+
+    proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=20)
+    if proc.returncode == 0:
+        print(f"[*] Remote Ubuntu firewall {action} applied for {safe_ip}")
+        return
+
+    detail = (proc.stderr or proc.stdout or "").strip()
+    print(f"[!] Remote Ubuntu firewall {action} failed for {safe_ip}: {detail}")
+
+
+def _remote_ban_callback(entry):
+    _run_remote_ubuntu_firewall_action(entry.identifier, "ban")
+
+
+def _remote_unban_callback(entry):
+    _run_remote_ubuntu_firewall_action(entry.identifier, "unban")
+
 # ── Predictor ─────────────────────────────────────────────────
+print("\n[*] SentinelIQ Startup Sequence Initiated...")
+print("[*] Loading Machine Learning Model into memory (this may take 15-30 seconds). Please wait...\n")
 pred = Predictor(MODELS_DIR, confidence_threshold=0.65)
 
 # ── Global state ──────────────────────────────────────────────
@@ -123,8 +335,12 @@ session_stats   = {
     "flows_processed": 0,
 }
 
+from core.log_collector import LogParser as _LogParser
+_log_parser = _LogParser()
+_log_source_stats = defaultdict(lambda: {"received": 0, "alerts_fired": 0, "last_seen": None})
+
 # ── Parallel capture queue ────────────────────────────────────
-_pcap_queue = queue.Queue(maxsize=3)
+_pcap_queue = queue.Queue(maxsize=2)
 
 
 # =============================================================================
@@ -143,13 +359,14 @@ def capture_thread():
                 r"C:\Program Files\Wireshark\tshark.exe",
                 "-i", CAPTURE_INTERFACE,
                 "-a", f"duration:{CAPTURE_DURATION}",
-                "-c", "50000",
                 "-F", "pcap",
                 "-w", pcap_file
             ], check=True, timeout=CAPTURE_DURATION + 5, capture_output=True)
 
             if not _pcap_queue.full():
                 _pcap_queue.put(pcap_file)
+            else:
+                print(f"[!] Capture queue full — dropping {pcap_file} (processing too slow)")
         except Exception as e:
             print(f"[!] Capture error: {e}")
             time.sleep(2)
@@ -168,80 +385,7 @@ def process_thread():
             print(f"[!] Process error: {e}")
 
 
-def _process_pcap(pcap_file: str):
-    """Core processing: extract flows → predict → correlate → save."""
-    global sequence_counter
-    timestamp = datetime.now().strftime("%H:%M:%S")
-
-    if not os.path.exists(pcap_file) or os.path.getsize(pcap_file) == 0:
-        return
-
-    try:
-        df, flow_metadata = pcap_to_flows_with_metadata(pcap_file)
-        if df.empty:
-            return
-
-        results = pred.predict_df_with_scores(df)
-        if not results:
-            return
-
-        prediction_counts = Counter()
-
-        with history_lock:
-            for idx, (label, score) in enumerate(results):
-                sequence_counter += 1
-
-                if idx >= len(flow_metadata):
-                    continue
-                flow_info = flow_metadata[idx]
-
-                if is_benign_system_traffic(flow_info):
-                    traffic_stats.record_flow(filtered=True)
-                    continue
-
-                traffic_stats.record_flow(filtered=False)
-                label, score = post_process_prediction(label, score, flow_info)
-                prediction_counts[label] += 1
-
-                # ── ML path → SIEM correlation ───────────────
-                try:
-                    unified_log = ingestion_pipeline.process_network_flow(
-                        src_ip=flow_info.get("src_ip", "0.0.0.0"),
-                        dst_ip=flow_info.get("dst_ip", "0.0.0.0"),
-                        src_port=int(flow_info.get("src_port", 0)),
-                        dst_port=int(flow_info.get("dst_port", 0)),
-                        protocol=flow_info.get("protocol", "TCP"),
-                        predicted_label=label,
-                        confidence=float(score),
-                        flow_features=flow_info,
-                    )
-                    triggered = correlation_engine.process_log(unified_log)
-
-                    if triggered:
-                        run_async(_save_alerts_to_postgres(triggered, unified_log))
-                        for a in triggered:
-                            traffic_stats.record_alert()
-                            print(f"[{timestamp}] 🚨 SIEM: {a.title} | {a.mitre_technique_id} | {a.rule.severity}")
-                    elif label.upper() != "BENIGN":
-                        traffic_stats.record_false_positive_prevented()
-
-                except Exception as siem_err:
-                    print(f"[!] SIEM error (non-fatal): {siem_err}")
-                    if should_generate_alert(label, score, flow_info):
-                        traffic_stats.record_alert()
-
-            session_stats["captures"] += 1
-            session_stats["flows_processed"] += len(df)
-
-        if prediction_counts:
-            print(f"[{timestamp}] 📊 {len(results)} flows → {dict(prediction_counts)}")
-
-        # ── Rule-based layer (catches what ML misses) ────────
-        _rule_based_detect(flow_metadata, timestamp)
-
-    except Exception as e:
-        print(f"[{timestamp}] ❌ Processing error: {e}")
-        import traceback; traceback.print_exc()
+# ── Pydantic models for log ingestion ────────────────────────
 
 
 # =============================================================================
@@ -286,12 +430,128 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log):
                 raw_log_id=db_log.id,
             )
             db_session.add(db_alert)
+            await db_session.flush()
             
-            # Send Email if Critical
+            # Email for CRITICAL; active defense for CRITICAL + HIGH
             if db_alert.severity == SeverityLevel.CRITICAL:
                 Thread(target=send_alert_email, args=(db_alert, enrichment.country_code or ''), daemon=True).start()
 
+            if db_alert.severity in (SeverityLevel.CRITICAL, SeverityLevel.HIGH):
+                _ban_ip_safely(
+                    db_alert.src_ip,
+                    attack_type=db_alert.attack_type,
+                    reason=f"{db_alert.severity} alert auto-ban: {db_alert.title}",
+                )
+                firewall_reason = f"{db_alert.severity} auto-block: {db_alert.title}"
+                firewall_applied = _apply_windows_firewall_block(db_alert.src_ip)
+                if firewall_applied:
+                    await _upsert_blocked_ip_record(
+                        db_session,
+                        db_alert.src_ip,
+                        reason=firewall_reason,
+                        alert_id=db_alert.id,
+                    )
+                if alert_data.extra and 'user_agent' in alert_data.extra:
+                    _ban_user_agent_safely(
+                        alert_data.extra['user_agent'],
+                        attack_type=db_alert.attack_type,
+                        reason=f"{db_alert.severity} alert auto-ban: {db_alert.title}",
+                    )
+
         await db_session.commit()
+
+
+async def _evaluate_and_save_log_event(event) -> bool:
+    """Run a ParsedLogEvent through the correlation engine and persist to DB."""
+    try:
+        _src_map = {
+            "auth": "AUTH", "linux-auth": "AUTH",
+            "nginx": "WEB", "apache": "WEB",
+            "syslog": "SYSLOG",
+        }
+        source = _src_map.get((event.source_type or "").lower(), "NETWORK")
+
+        unified_log = ingestion_pipeline.process_raw(source, {
+            "src_ip":      event.src_ip,
+            "dst_ip":      event.dst_ip or "",
+            "event_type":  event.event_type,
+            "username":    event.username,
+            "message":     event.message,
+            "extra":       event.extra or {},
+        })
+
+        triggered = correlation_engine.process_log(unified_log)
+        if not triggered:
+            return False
+
+        async with AsyncSessionLocal() as db_session:
+            db_log = NormalizedLog(
+                source=source,
+                src_ip=event.src_ip,
+                dst_ip=event.dst_ip or "",
+                event_type=event.event_type,
+                username=event.username,
+                message=event.message,
+                extra=event.extra or {},
+            )
+            db_session.add(db_log)
+            await db_session.flush()
+
+            for alert_data in triggered:
+                enrichment = await threat_intel.enrich_ip(alert_data.src_ip)
+                attack_type = EVENT_TYPE_MAPPINGS.get(alert_data.attack_type, alert_data.attack_type)
+                title       = alert_data.title
+                sev_str     = alert_data.rule.severity
+
+                row = Alert(
+                    title=title,
+                    description=alert_data.description,
+                    severity=SeverityLevel(sev_str),
+                    src_ip=alert_data.src_ip,
+                    dst_ip=alert_data.dst_ip,
+                    attack_type=attack_type,
+                    confidence=alert_data.confidence,
+                    rule_id=alert_data.rule.rule_id,
+                    mitre_tactic=alert_data.mitre_tactic,
+                    mitre_technique_id=alert_data.mitre_technique_id,
+                    mitre_technique_name=alert_data.mitre_technique_name,
+                    ip_country=enrichment.country_code,
+                    ip_isp=enrichment.isp,
+                    ip_abuse_score=enrichment.abuse_score,
+                    is_known_malicious=enrichment.is_known_malicious,
+                    raw_log_id=db_log.id,
+                )
+                db_session.add(row)
+                await db_session.flush()
+
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [LOG] LOG ALERT: {title} | {sev_str}")
+
+                if row.severity == SeverityLevel.CRITICAL:
+                    Thread(target=send_alert_email, args=(row, enrichment.country_code or ''), daemon=True).start()
+
+                if row.severity in (SeverityLevel.CRITICAL, SeverityLevel.HIGH):
+                    _ban_ip_safely(event.src_ip, attack_type=attack_type,
+                                   reason=f"{row.severity} log alert auto-ban: {title}")
+                    fw_ok = _apply_windows_firewall_block(event.src_ip)
+                    if fw_ok:
+                        await _upsert_blocked_ip_record(
+                            db_session, event.src_ip,
+                            reason=f"{row.severity} log auto-block: {title}",
+                            alert_id=row.id,
+                        )
+                    if hasattr(event, 'extra') and event.extra and 'user_agent' in event.extra:
+                        _ban_user_agent_safely(event.extra['user_agent'], attack_type=attack_type,
+                                               reason=f"{row.severity} log alert auto-ban: {title}")
+
+            await db_session.commit()
+
+        traffic_stats.record_alert()
+        _log_source_stats[event.source_type]["alerts_fired"] += 1
+        return True
+
+    except Exception as e:
+        print(f"[!] Log alert save error: {e}")
+        return False
 
 
 # =============================================================================
@@ -306,6 +566,7 @@ _rb_state = {
     "ftp_attempts":      _dd(int),
     "bot_ports":         _dd(int),
     "http_reqs":         _dd(int),
+    "ua_reqs":           _dd(int),
     "last_alert":        _dd(float),
 }
 _RB_COOLDOWN = 30
@@ -321,214 +582,215 @@ def _rb_can_alert(key: str) -> bool:
 
 def _rule_based_detect(flow_metadata: list, ts: str):
     C2_PORTS = {6667, 6668, 6669, 4444, 8080, 9090, 1080, 5555, 31337}
+    FLOOD_PKT_THRESHOLD = 200   # packets from one source in a 10s window → flood
 
-    local_ports = _dd(set)
-    ssh_hits = _dd(int)
-    ftp_hits = _dd(int)
-    bot_hits = _dd(int)
-    http_hits = _dd(int)
+    local_ports  = _dd(set)
+    ssh_hits     = _dd(int)
+    ftp_hits     = _dd(int)
+    bot_hits     = _dd(int)
+    http_hits    = _dd(int)
+    flood_pkts   = _dd(int)   # packet volume per source in this capture window
+    dst_per_src  = _dd(str)   # most recent non-zero dst_ip seen per attacker src
 
     for fl in flow_metadata:
+        if is_benign_system_traffic(fl):
+            src = fl.get("src_ip", "")
+            if src:
+                _rb_state["dst_ports_per_src"][src].clear()
+                _rb_state["ssh_attempts"][src] = 0
+                _rb_state["ftp_attempts"][src] = 0
+                _rb_state["bot_ports"][src] = 0
+            continue
+
         src   = fl.get("src_ip", "")
         dst   = fl.get("dst_ip", "")
         dport = int(fl.get("dst_port", 0))
+
+        if dst and dst != "0.0.0.0":
+            dst_per_src[src] = dst
         proto = fl.get("protocol", "TCP")
+        pkt_n = int(fl.get("packet_count", 1))
 
-        local_ports[src].add(dport)
-        if dport == 22:  ssh_hits[src]  += 1
-        if dport == 21:  ftp_hits[src]  += 1
-        if dport in C2_PORTS: bot_hits[src] += 1
-        if dport == 80 and proto == "TCP": http_hits[dst] += 1
+        if proto == "TCP":
+            local_ports[src].add(dport)
 
+        if dport == 22:           ssh_hits[src] += 1
+        if dport == 21:           ftp_hits[src] += 1
+        if dport in C2_PORTS:     bot_hits[src] += 1
+        if dport == 80 and proto == "TCP":
+            http_hits[dst] += 1
+            ua = fl.get('extra', {}).get('user_agent', '') if 'extra' in fl else fl.get('user_agent', '')
+            if ua and len(ua) > 5:
+                _rb_state["ua_reqs"][ua] += 1
+
+        flood_pkts[src] += pkt_n   # count raw packet volume per source
+
+    # ── Merge into persistent state ──────────────────────────────
     for src, ports in local_ports.items():
         _rb_state["dst_ports_per_src"][src] |= ports
     for src, n in ssh_hits.items():  _rb_state["ssh_attempts"][src] += n
     for src, n in ftp_hits.items():  _rb_state["ftp_attempts"][src] += n
     for src, n in bot_hits.items():  _rb_state["bot_ports"][src]    += n
-    for dst, n in http_hits.items(): _rb_state["http_reqs"][dst]    += n
 
-    rb_alerts = []
+    # ── Alert-firing helper ───────────────────────────────────────
+    def _rb_fire(src_ip, label, event_type, conf, reason, dst_ip=None):
+        try:
+            resolved_dst = dst_ip or dst_per_src.get(src_ip, "0.0.0.0")
+            log = ingestion_pipeline.process_network_flow(
+                src_ip=src_ip, dst_ip=resolved_dst,
+                src_port=0, dst_port=0, protocol="TCP",
+                predicted_label=label, confidence=conf,
+                flow_features={"rule_based": True, "reason": reason},
+            )
+            triggered = correlation_engine.process_log(log)
+            if triggered:
+                run_async(_save_alerts_to_postgres(triggered, log))
+                for a in triggered:
+                    traffic_stats.record_alert()
+                    print(f"[{ts}] [ALERT] RB-{event_type}: {a.title} | {a.rule.severity}")
+        except Exception as e:
+            print(f"[!] Rule-based alert error ({event_type}): {e}")
 
+    # ── Packet flood / SYN flood (catches hping3 and similar) ────
+    for src, n in flood_pkts.items():
+        if n >= FLOOD_PKT_THRESHOLD and _rb_can_alert(f"flood:{src}"):
+            print(f"[{ts}] [ALERT] Packet flood: {src} sent {n} pkts in window")
+            _rb_fire(src, "DDoS", "ddos", 0.88, f"pkt_flood:{n}")
+
+    # ── Port scan ─────────────────────────────────────────────────
     for src, ports in list(_rb_state["dst_ports_per_src"].items()):
-        if len(ports) >= 30 and _rb_can_alert(f"portscan:{src}"):
-            rb_alerts.append({"title": f"Port Scan from {src}", "attack_type": "PortScan",
-                               "severity": "MEDIUM", "src_ip": src, "confidence": 0.91,
-                               "mitre_technique_id": "T1046", "mitre_tactic": "Reconnaissance",
-                               "mitre_technique_name": "Network Service Discovery"})
-            _rb_state["dst_ports_per_src"][src].clear()
+        if len(ports) >= 30 and _rb_can_alert(f"scan:{src}"):
+            print(f"[{ts}] [ALERT] Port scan: {src} → {len(ports)} ports")
+            _rb_fire(src, "PortScan", "port_scan", 0.85, f"portscan:{len(ports)}")
+            _rb_state["dst_ports_per_src"][src].clear()  # reset so it doesn't re-fire on empty windows
 
+    # ── SSH brute force ───────────────────────────────────────────
     for src, n in list(_rb_state["ssh_attempts"].items()):
-        if n >= 10 and _rb_can_alert(f"ssh:{src}"):
-            rb_alerts.append({"title": f"SSH Brute Force from {src} ({n} attempts)",
-                               "attack_type": "SSH-Patator", "severity": "HIGH", "src_ip": src,
-                               "confidence": 0.89, "mitre_technique_id": "T1110",
-                               "mitre_tactic": "Credential Access", "mitre_technique_name": "Brute Force"})
-            _rb_state["ssh_attempts"][src] = 0
+        if n >= 5 and _rb_can_alert(f"ssh:{src}"):
+            print(f"[{ts}] [ALERT] SSH brute force: {src} → {n} attempts")
+            _rb_fire(src, "SSH-Patator", "ssh_brute_force", 0.85, f"ssh_bf:{n}")
+            _rb_state["ssh_attempts"][src] = 0  # reset so it doesn't re-fire on empty windows
 
+    # ── FTP brute force ───────────────────────────────────────────
     for src, n in list(_rb_state["ftp_attempts"].items()):
-        if n >= 10 and _rb_can_alert(f"ftp:{src}"):
-            rb_alerts.append({"title": f"FTP Brute Force from {src} ({n} attempts)",
-                               "attack_type": "FTP-Patator", "severity": "HIGH", "src_ip": src,
-                               "confidence": 0.87, "mitre_technique_id": "T1110",
-                               "mitre_tactic": "Credential Access", "mitre_technique_name": "Brute Force"})
-            _rb_state["ftp_attempts"][src] = 0
+        if n >= 5 and _rb_can_alert(f"ftp:{src}"):
+            print(f"[{ts}] [ALERT] FTP brute force: {src} → {n} attempts")
+            _rb_fire(src, "FTP-Patator", "ftp_brute_force", 0.85, f"ftp_bf:{n}")
+            _rb_state["ftp_attempts"][src] = 0  # reset so it doesn't re-fire on empty windows
 
-    for src, n in list(_rb_state["bot_ports"].items()):
-        if n >= 5 and _rb_can_alert(f"bot:{src}"):
-            rb_alerts.append({"title": f"Botnet C&C Activity from {src}", "attack_type": "Bot",
-                               "severity": "HIGH", "src_ip": src, "confidence": 0.85,
-                               "mitre_technique_id": "T1071", "mitre_tactic": "Command and Control",
-                               "mitre_technique_name": "Application Layer Protocol"})
-            _rb_state["bot_ports"][src] = 0
 
-    for dst, n in list(_rb_state["http_reqs"].items()):
-        if n >= 50 and _rb_can_alert(f"hulk:{dst}"):
-            rb_alerts.append({"title": f"DoS HTTP Flood against {dst} ({n} requests)",
-                               "attack_type": "DoS Hulk", "severity": "CRITICAL", "src_ip": "multiple",
-                               "confidence": 0.93, "mitre_technique_id": "T1499",
-                               "mitre_tactic": "Impact", "mitre_technique_name": "Endpoint Denial of Service"})
-            _rb_state["http_reqs"][dst] = 0
+def _process_pcap(pcap_file: str):
+    """Process ONE pcap file independently. No global accumulation."""
+    global sequence_counter
+    timestamp = datetime.now().strftime("%H:%M:%S")
 
-    if not rb_alerts:
+    if not os.path.exists(pcap_file):
+        return
+    pcap_size = os.path.getsize(pcap_file)
+    if pcap_size == 0:
+        print(f"[{timestamp}] [*] Pcap empty (0 bytes): {pcap_file}")
         return
 
-    async def _save_rb():
-        from database import AlertStatus
-        from datetime import datetime as _dt
-        try:
-            async with AsyncSessionLocal() as session:
-                sev_map = {"LOW": SeverityLevel.LOW, "MEDIUM": SeverityLevel.MEDIUM,
-                           "HIGH": SeverityLevel.HIGH, "CRITICAL": SeverityLevel.CRITICAL}
-                for a in rb_alerts:
-                    enrichment = await threat_intel.enrich_ip(a["src_ip"])
-                    row = Alert(
-                        title=a["title"],
-                        severity=sev_map.get(a["severity"], SeverityLevel.MEDIUM),
-                        attack_type=a["attack_type"],
-                        src_ip=a["src_ip"], dst_ip="",
-                        confidence=a["confidence"],
-                        mitre_technique_id=a["mitre_technique_id"],
-                        mitre_tactic=a.get("mitre_tactic", ""),
-                        mitre_technique_name=a.get("mitre_technique_name", ""),
-                        ip_country=enrichment.country_code,
-                        ip_isp=enrichment.isp,
-                        ip_abuse_score=enrichment.abuse_score,
-                        is_known_malicious=enrichment.is_known_malicious,
-                        status=AlertStatus.NEW,       # ← fixed: was OPEN
-                        created_at=_dt.utcnow(),
-                    )
-                    session.add(row)
-                    
-                    # TRIGGER EMAIL FOR CRITICAL ALERTS FROM RULE BASED ENGINE
-                    if row.severity == SeverityLevel.CRITICAL:
-                        Thread(target=send_alert_email, args=(row, enrichment.country_code or ''), daemon=True).start()
-                        
-                    traffic_stats.record_alert()
-                    print(f"[{ts}] 🚨 RB-ALERT: {a['title']} | {a['severity']}")
-                await session.commit()
-        except Exception as e:
-            print(f"[!] RB alert save error: {e}")
-
-    # run_async expects a coroutine object, not a function
-    run_async(_save_rb())
-
-
-# =============================================================================
-# LOG INGESTION — single implementation using _log_parser
-# =============================================================================
-
-# Lazy import to avoid circular issues
-try:
-    from core.log_collector import LogParser as _LogParser
-    _log_parser = _LogParser()
-except Exception:
-    _log_parser = None
-
-_log_source_stats: dict = defaultdict(lambda: {"received": 0, "alerts_fired": 0, "last_seen": None})
-_log_throttle: dict = defaultdict(float)
-_LOG_THROTTLE_S = 10
-
-
-def _log_can_alert(key: str) -> bool:
-    now = time.time()
-    if now - _log_throttle[key] > _LOG_THROTTLE_S:
-        _log_throttle[key] = now
-        return True
-    return False
-
-
-LOG_RULES = {
-    "ssh_failed_login":     ("SSH-Patator",   "HIGH",     "Brute Force SSH Login from {src}",     "T1110", "Credential Access",     "Brute Force"),
-    "auth_root_login":      ("SSH-Patator",   "CRITICAL", "Root Login Attempt from {src}",         "T1078", "Initial Access",        "Valid Accounts"),
-    "sudo_privilege_esc":   ("PrivilegeEsc",  "HIGH",     "Sudo Privilege Escalation by {user}",  "T1548", "Privilege Escalation",  "Abuse Elevation Control Mechanism"),
-    "ssh_invalid_user":     ("SSH-Patator",   "MEDIUM",   "SSH Invalid User Probe from {src}",    "T1110", "Credential Access",     "Brute Force"),
-    "nginx_sql_injection":  ("Web Attack",    "CRITICAL", "SQL Injection from {src}",             "T1190", "Initial Access",        "Exploit Public-Facing Application"),
-    "nginx_xss_attempt":    ("Web Attack",    "HIGH",     "XSS Attempt from {src}",               "T1190", "Initial Access",        "Exploit Public-Facing Application"),
-    "nginx_path_traversal": ("Web Attack",    "HIGH",     "Path Traversal from {src}",            "T1083", "Discovery",             "File and Directory Discovery"),
-    "nginx_4xx":            ("Web Scanner",   "MEDIUM",   "Web Scan/Probe from {src}",            "T1595", "Reconnaissance",        "Active Scanning"),
-    "nginx_5xx":            ("DoS",           "HIGH",     "Server Error Spike from {src}",        "T1499", "Impact",                "Endpoint Denial of Service"),
-    "auth_failed_login":    ("Auth Brute",    "HIGH",     "Windows Login Failure from {src}",     "T1110", "Credential Access",     "Brute Force"),
-    "account_created":      ("Persistence",   "HIGH",     "New User Account Created",             "T1136", "Persistence",           "Create Account"),
-    "audit_cleared":        ("Defense Evasion","CRITICAL","Audit Log Cleared",                    "T1070", "Defense Evasion",       "Indicator Removal"),
-    "service_installed":    ("Persistence",   "HIGH",     "New Service Installed",                "T1543", "Persistence",           "Create or Modify System Process"),
-    "syslog_security_event":("Syslog",        "MEDIUM",   "Security Event: {msg}",               "T1059", "Execution",             "Command and Scripting Interpreter"),
-}
-
-
-async def _evaluate_and_save_log_event(event) -> bool:
-    from database import AlertStatus
-    from datetime import datetime as _dt
-
-    rule = LOG_RULES.get(event.event_type)
-    if not rule:
-        return False
-
-    attack_type, sev_str, title_tpl, mitre_id, mitre_tactic, mitre_name = rule
-
-    throttle_key = f"{event.event_type}:{event.src_ip}"
-    if not _log_can_alert(throttle_key):
-        return False
-
-    title = title_tpl.format(
-        src=event.src_ip,
-        user=event.username or "unknown",
-        msg=(event.message or "")[:60],
-    )
-
-    sev_map = {"LOW": SeverityLevel.LOW, "MEDIUM": SeverityLevel.MEDIUM,
-               "HIGH": SeverityLevel.HIGH, "CRITICAL": SeverityLevel.CRITICAL}
-
     try:
-        async with AsyncSessionLocal() as session:
-            enrichment = await threat_intel.enrich_ip(event.src_ip)
-            row = Alert(
-                title=title,
-                severity=sev_map.get(sev_str, SeverityLevel.MEDIUM),
-                attack_type=attack_type,
-                src_ip=event.src_ip,
-                dst_ip=getattr(event, "dst_ip", "") or "",
-                confidence=0.95,
-                mitre_technique_id=mitre_id,
-                mitre_tactic=mitre_tactic,
-                mitre_technique_name=mitre_name,
-                ip_country=enrichment.country_code,
-                ip_isp=enrichment.isp,
-                ip_abuse_score=enrichment.abuse_score,
-                is_known_malicious=enrichment.is_known_malicious,
-                status=AlertStatus.NEW,       # ← fixed: was OPEN
-                created_at=_dt.utcnow(),
-            )
-            session.add(row)
-            await session.commit()
+        # Quick raw packet count diagnostic using scapy
+        from scapy.all import rdpcap, IP
+        _raw = rdpcap(pcap_file)
+        _ip_count = sum(1 for p in _raw if IP in p)
+        print(f"[{timestamp}] [PCAP] {os.path.basename(pcap_file)} — "
+              f"{len(_raw)} pkts total, {_ip_count} IP pkts, {pcap_size//1024}KB  "
+              f"(interface={CAPTURE_INTERFACE})")
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🪵 LOG ALERT: {title} | {sev_str}")
-        traffic_stats.record_alert()
-        _log_source_stats[event.source_type]["alerts_fired"] += 1
-        return True
+        if _ip_count == 0:
+            print(f"[{timestamp}] [!] No IP packets — check CAPTURE_INTERFACE (run: tshark -D)")
+            _rule_based_detect([], timestamp)
+            return
+
+        df, flow_metadata = pcap_to_flows_with_metadata(pcap_file)
+
+        if df.empty:
+            print(f"[{timestamp}] [*] No flows extracted (all filtered by whitelist/multicast)")
+            _rule_based_detect(flow_metadata, timestamp)
+            return
+
+        # Safety check — skip if too many flows (pcap too large)
+        if len(df) > 5000:
+            print(f"[{timestamp}] [WARN]  Too many flows ({len(df)}) — skipping to avoid lag")
+            _rule_based_detect(flow_metadata, timestamp)
+            return
+
+        print(f"[{timestamp}] [SCAN] Extracted {len(df)} flows — running ML...")
+
+        results = pred.predict_df_with_scores(df)
+        if not results:
+            _rule_based_detect(flow_metadata, timestamp)
+            return
+
+        prediction_counts = Counter()
+
+        with history_lock:
+            for flow_info in flow_metadata:
+                if is_benign_system_traffic(flow_info):
+                    traffic_stats.record_flow(filtered=True)
+                else:
+                    traffic_stats.record_flow(filtered=False)
+
+            for idx, (label, score) in enumerate(results):
+                sequence_counter += 1
+
+                flow_idx = idx + 4
+                if flow_idx >= len(flow_metadata):
+                    continue
+                flow_info = flow_metadata[flow_idx]
+
+                if is_benign_system_traffic(flow_info):
+                    continue
+
+                label, score = post_process_prediction(label, score, flow_info)
+                prediction_counts[label] += 1
+
+                # ── ML path -> SIEM correlation ───────────────
+                try:
+                    unified_log = ingestion_pipeline.process_network_flow(
+                        src_ip=flow_info.get("src_ip", "0.0.0.0"),
+                        dst_ip=flow_info.get("dst_ip", "0.0.0.0"),
+                        src_port=int(flow_info.get("src_port", 0)),
+                        dst_port=int(flow_info.get("dst_port", 0)),
+                        protocol=flow_info.get("protocol", "TCP"),
+                        predicted_label=label,
+                        confidence=float(score),
+                        flow_features=flow_info,
+                    )
+                    triggered = correlation_engine.process_log(unified_log)
+
+                    if triggered:
+                        run_async(_save_alerts_to_postgres(triggered, unified_log))
+                        for a in triggered:
+                            traffic_stats.record_alert()
+                            print(f"[{timestamp}] [ALERT] SIEM: {a.title} | {a.mitre_technique_id} | {a.rule.severity}")
+                    elif label.upper() != "BENIGN":
+                        traffic_stats.record_false_positive_prevented()
+
+                except Exception as siem_err:
+                    print(f"[!] SIEM error (non-fatal): {siem_err}")
+                    if should_generate_alert(label, score, flow_info):
+                        traffic_stats.record_alert()
+
+            session_stats["captures"] += 1
+            session_stats["flows_processed"] += len(df)
+
+        if prediction_counts:
+            non_benign = {k: v for k, v in prediction_counts.items() if k != "BENIGN"}
+            if non_benign:
+                print(f"[{timestamp}] [RED] ATTACKS: {non_benign}")
+            else:
+                print(f"[{timestamp}] [OK] {len(results)} flows -> BENIGN")
+
+        # ── Rule-based layer (catches what ML misses) ────────
+        _rule_based_detect(flow_metadata, timestamp)
 
     except Exception as e:
-        print(f"[!] Log alert save error: {e}")
-        return False
+        print(f"[{timestamp}] [ERR] Processing error: {e}")
+        import traceback; traceback.print_exc()
 
 
 # ── Pydantic models for log ingestion ────────────────────────
@@ -592,15 +854,9 @@ async def ingest_bulk(request: BulkLogRequest):
         results["parsed"] += 1
         parsed_events.append(event)
 
-    # Deduplicate: one alert per (event_type, src_ip)
-    seen: dict = {}
+    # Process every event individually so the correlation engine counts
+    # each occurrence — the AlertSuppressor prevents alert storms.
     for ev in parsed_events:
-        key = (ev.event_type, ev.src_ip)
-        if key not in seen:
-            seen[key] = ev
-
-    # Evaluate
-    for ev in seen.values():
         if await _evaluate_and_save_log_event(ev):
             results["alerts_fired"] += 1
 
@@ -619,37 +875,67 @@ async def log_sources():
 # API ENDPOINTS
 # =============================================================================
 
+from datetime import datetime, timedelta
+
 @app.get("/api/siem/alerts")
-async def siem_alerts(limit: int = Query(50, le=500)):
+async def siem_alerts(
+    limit: int = Query(100, le=500),
+    attack_type: str = Query(None),
+    src_ip: str = Query(None),
+    minutes: int = Query(None, ge=1, le=1440)  # [OK] NEW
+):
     from sqlalchemy import select, desc
     from database import Alert as SiemAlert, BlockedIP
+
     try:
         async with AsyncSessionLocal() as s:
-            result = await s.execute(
-                select(SiemAlert).order_by(desc(SiemAlert.id)).limit(limit)
-            )
+            stmt = select(SiemAlert)
+
+            # [OK] NEW: time filter
+            if minutes:
+                since = datetime.utcnow() - timedelta(minutes=minutes)
+                stmt = stmt.where(SiemAlert.created_at >= since)
+
+            stmt = stmt.order_by(desc(SiemAlert.created_at))  # [OK] FIX (better than id)
+
+            if attack_type:
+                stmt = stmt.where(SiemAlert.attack_type.ilike(f"%{attack_type}%"))
+            if src_ip:
+                stmt = stmt.where(SiemAlert.src_ip.ilike(f"%{src_ip}%"))
+
+            result = await s.execute(stmt.limit(limit))
             alerts = result.scalars().all()
-            
-            # Fetch active blocked IPs
+
             blocked_r = await s.execute(select(BlockedIP.ip_address))
             blocked_set = {row[0] for row in blocked_r.all()}
 
         return {
             "alerts": [{
-                "id": a.id, "title": a.title, "severity": str(a.severity),
-                "src_ip": a.src_ip, "attack_type": a.attack_type, "confidence": a.confidence,
-                "mitre_tactic": a.mitre_tactic, "mitre_technique_id": a.mitre_technique_id,
+                "id": a.id,
+                "title": a.title,
+                "severity": str(a.severity),
+                "src_ip": a.src_ip,
+                "attack_type": a.attack_type,
+                "confidence": a.confidence,
+                "mitre_tactic": a.mitre_tactic,
+                "mitre_technique_id": a.mitre_technique_id,
                 "mitre_technique_name": a.mitre_technique_name,
                 "is_known_malicious": a.is_known_malicious,
+                "dst_ip": a.dst_ip,
                 "is_blocked": a.src_ip in blocked_set,
-                "ip_country": a.ip_country, "ip_isp": a.ip_isp, "ip_abuse_score": a.ip_abuse_score,
-                "created_at": a.created_at.isoformat() + "Z" if a.created_at else None,
+                "ip_country": a.ip_country,
+                "ip_isp": a.ip_isp,
+                "ip_abuse_score": a.ip_abuse_score,
+
+                # [OK] FIX: always UTC ISO
+                "created_at": a.created_at.replace(tzinfo=None).isoformat() + "Z"
+                if a.created_at else None,
             } for a in alerts],
             "total": len(alerts),
         }
+
     except Exception as e:
         return {"error": str(e), "alerts": []}
-
 
 @app.get("/api/siem/trusted-ips")
 async def get_trusted_ips():
@@ -678,6 +964,9 @@ async def add_trusted_ip(data: TrustedIPCreate):
             new_ip = TrustedIP(ip_prefix=data.ip_prefix, description=desc)
             s.add(new_ip)
             await s.commit()
+            
+        # Refresh the in-memory cache immediately
+        await _load_trusted_ips_on_startup()
         return {"success": True}
     except IntegrityError:
         # IP already exists, safe to ignore
@@ -694,6 +983,9 @@ async def delete_trusted_ip(ip_id: int):
     async with AsyncSessionLocal() as s:
         await s.execute(delete(TrustedIP).where(TrustedIP.id == ip_id))
         await s.commit()
+        
+    # Refresh the in-memory cache immediately
+    await _load_trusted_ips_on_startup()
     return {"success": True}
 
 
@@ -739,6 +1031,160 @@ async def get_alerts(limit: int = Query(50, ge=1, le=1000)):
         return {"error": str(e)}
 
 
+@app.get("/api/debug/pipeline")
+async def debug_pipeline():
+    """
+    Live pipeline health-check.
+    Hit this while an attack is running to see exactly where flows are going.
+    """
+    from core.correlation import CLASS_THRESHOLDS, DEFAULT_RULES
+    rules_summary = {r.rule_id: {"name": r.name, "threshold": r.count_threshold, "window": r.window_seconds} for r in DEFAULT_RULES}
+    engine_stats = correlation_engine.get_stats()
+    sup = correlation_engine.suppressor._last_alert
+
+    # Current event counters inside the sliding-window engine
+    event_counts = {}
+    for etype, ips in correlation_engine._event_counts.items():
+        event_counts[etype] = {ip: len(ts) for ip, ts in ips.items() if ts}
+
+    return {
+        "predictor_threshold":  pred.confidence_threshold,
+        "class_thresholds":     CLASS_THRESHOLDS,
+        "traffic_stats":        traffic_stats.get_summary(),
+        "engine_stats":         engine_stats,
+        "active_event_counts":  event_counts,
+        "suppressor_keys":      list(sup.keys()),
+        "capture_interface":    CAPTURE_INTERFACE,
+        "capture_duration_s":   CAPTURE_DURATION,
+    }
+
+
+@app.post("/api/pcap/ingest")
+async def ingest_pcap_from_ubuntu(request: Request):
+    """
+    Receive a raw pcap file POSTed by ubuntu_forwarder.py.
+    Writes to a temp file then feeds it through the same ML pipeline
+    that processes local captures.
+    """
+    data = await request.body()
+    if len(data) < 25:
+        return {"status": "skipped", "reason": "payload too small"}
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False, dir=_DATA_DIR) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [REMOTE PCAP] Received {len(data)//1024}KB from Ubuntu forwarder")
+
+    attack_counts: dict = {}
+    flow_metadata = []
+    df = None
+    try:
+        from flow_extractor import pcap_to_flows_with_metadata
+        from traffic_filter import is_benign_system_traffic, post_process_prediction
+        df, flow_metadata = pcap_to_flows_with_metadata(tmp_path)
+
+        if df.empty:
+            # No flows extracted — still run rule-based on raw metadata
+            _rule_based_detect(flow_metadata, ts)
+            return {"status": "ok", "flows": 0, "attacks": {}}
+
+        # ── Flood fast-path ────────────────────────────────────────────
+        # hping3 / SYN floods create 1 huge flow (same 5-tuple, 10K+ packets).
+        # ML needs ≥5 flows — it will be skipped. Detect the flood directly
+        # from the metadata before trying the ML path.
+        with history_lock:
+            for meta in flow_metadata:
+                if is_benign_system_traffic(meta):
+                    continue
+                pkt_count = meta.get("packet_count", 0)
+                src = meta.get("src_ip", "unknown")
+                if pkt_count >= 500:
+                    print(f"[{ts}] [FLOOD] {src} → {pkt_count} pkts in one flow — fast-path DDoS")
+                    attack_counts["DDoS"] = attack_counts.get("DDoS", 0) + 1
+                    try:
+                        log = ingestion_pipeline.process_network_flow(
+                            src_ip=src,
+                            dst_ip=meta.get("dst_ip", "0.0.0.0"),
+                            src_port=int(meta.get("src_port", 0)),
+                            dst_port=int(meta.get("dst_port", 0)),
+                            protocol=meta.get("protocol", "TCP"),
+                            predicted_label="DDoS",
+                            confidence=0.92,
+                            flow_features={"flood_packets": pkt_count, "fast_path": True},
+                        )
+                        triggered = correlation_engine.process_log(log)
+                        if triggered:
+                            run_async(_save_alerts_to_postgres(triggered, log))
+                            for a in triggered:
+                                traffic_stats.record_alert()
+                                print(f"[{ts}] [ALERT] FLOOD: {a.title} | {a.rule.severity}")
+                    except Exception as fe:
+                        print(f"[!] Flood fast-path error: {fe}")
+
+        # ── Normal ML path ─────────────────────────────────────────────
+        results = pred.predict_df_with_scores(df)
+        flows_processed = 0
+
+        with history_lock:
+            for idx, (label, score) in enumerate(results):
+                flow_idx = idx + 4
+                if flow_idx >= len(flow_metadata):
+                    continue
+                flow_info = flow_metadata[flow_idx]
+
+                if is_benign_system_traffic(flow_info):
+                    continue
+
+                label, score = post_process_prediction(label, score, flow_info)
+                flows_processed += 1
+
+                if label.upper() != "BENIGN":
+                    attack_counts[label] = attack_counts.get(label, 0) + 1
+
+                try:
+                    unified_log = ingestion_pipeline.process_network_flow(
+                        src_ip=flow_info.get("src_ip", "0.0.0.0"),
+                        dst_ip=flow_info.get("dst_ip", "0.0.0.0"),
+                        src_port=int(flow_info.get("src_port", 0)),
+                        dst_port=int(flow_info.get("dst_port", 0)),
+                        protocol=flow_info.get("protocol", "TCP"),
+                        predicted_label=label,
+                        confidence=float(score),
+                        flow_features=flow_info,
+                    )
+                    triggered = correlation_engine.process_log(unified_log)
+                    if triggered:
+                        run_async(_save_alerts_to_postgres(triggered, unified_log))
+                        for a in triggered:
+                            traffic_stats.record_alert()
+                            print(f"[{ts}] [ALERT] REMOTE: {a.title} | {a.rule.severity}")
+                except Exception as siem_err:
+                    print(f"[!] SIEM error (remote pcap): {siem_err}")
+
+        session_stats["captures"] += 1
+        session_stats["flows_processed"] += flows_processed
+
+        if attack_counts:
+            print(f"[{ts}] [REMOTE RED] ATTACKS: {attack_counts}")
+
+        # ── Rule-based layer (catches what ML misses) ──────────────────
+        _rule_based_detect(flow_metadata, ts)
+
+    except Exception as e:
+        print(f"[{ts}] [!] Remote pcap processing error: {e}")
+        import traceback; traceback.print_exc()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return {"status": "ok", "flows": len(df) if df is not None else 0, "attacks": attack_counts}
+
+
 @app.get("/api/stats")
 async def get_stats(days: int = Query(7, ge=1, le=30)):
     from sqlalchemy import select, func
@@ -765,7 +1211,7 @@ async def acknowledge_alert(alert_id: int):
             alert = result.scalar_one_or_none()
             if not alert:
                 raise HTTPException(status_code=404, detail="Alert not found")
-            alert.status = AlertStatus.RESOLVED
+            alert.status = AlertStatus.INVESTIGATING
             await s.commit()
         return {"success": True}
     except Exception as e:
@@ -784,7 +1230,7 @@ async def block_ip_from_alert(alert_id: int):
                 raise HTTPException(status_code=404, detail="Alert not found")
             
             ip = alert.src_ip
-            if ip in ("127.0.0.1", "localhost", "0.0.0.0", "multiple", "") or ip.startswith("192.168.56."):
+            if ip in ("127.0.0.1", "localhost", "0.0.0.0", "multiple", ""):
                 raise HTTPException(status_code=400, detail="Cannot block internal/invalid IP")
                 
             # Handle duplicate key if already blocked
@@ -792,14 +1238,13 @@ async def block_ip_from_alert(alert_id: int):
             if existing_block.scalar_one_or_none():
                 return {"success": True, "blocked_ip": ip, "firewall_status": "Already Blocked"}
                 
-            # Execute Windows Firewall block command via PowerShell
-            cmd = f'New-NetFirewallRule -DisplayName "SentinelIQ Block {ip}" -Direction Inbound -Action Block -RemoteAddress {ip}'
-            print(f"[*] Executing firewall block: {cmd}")
-            proc = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
-            
-            if proc.returncode != 0:
-                print(f"[!] Firewall block warning: {proc.stderr}")
-                
+            # Execute Windows Firewall block via reusable helper (admin-aware)
+            firewall_ok = _apply_windows_firewall_block(ip)
+            firewall_status = "OK" if firewall_ok else (
+                "Skipped — restart backend as Administrator to enable Windows Firewall blocking"
+                if not _RUNNING_AS_ADMIN else "Failed"
+            )
+
             # Log the action
             block_log = BlockedIP(
                 ip_address=ip,
@@ -810,8 +1255,8 @@ async def block_ip_from_alert(alert_id: int):
             s.add(block_log)
             alert.status = AlertStatus.INVESTIGATING
             await s.commit()
-            
-        return {"success": True, "blocked_ip": ip, "firewall_status": proc.stderr.strip() if proc.returncode != 0 else "OK"}
+
+        return {"success": True, "blocked_ip": ip, "firewall_status": firewall_status}
     except HTTPException:
         raise
     except Exception as e:
@@ -830,12 +1275,16 @@ async def unblock_ip_from_alert(alert_id: int):
                 raise HTTPException(status_code=404, detail="Alert not found")
             
             ip = alert.src_ip
-            
-            # Execute Windows Firewall unblock command via PowerShell
-            cmd = f'Remove-NetFirewallRule -DisplayName "SentinelIQ Block {ip}"'
-            print(f"[*] Executing firewall unblock: {cmd}")
-            proc = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
-            
+
+            # Execute Windows Firewall unblock (admin-aware)
+            if _RUNNING_AS_ADMIN:
+                rule_name = _firewall_rule_name(ip)
+                cmd = f'Remove-NetFirewallRule -DisplayName "{rule_name}" -ErrorAction SilentlyContinue'
+                proc = subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True)
+                print(f"[*] Firewall unblock for {ip}: rc={proc.returncode}")
+            else:
+                print(f"[!] Firewall unblock skipped (no admin) for {ip}")
+
             # Remove from BlockedIP table
             await s.execute(delete(BlockedIP).where(BlockedIP.ip_address == ip))
             await s.commit()
@@ -873,9 +1322,153 @@ async def diagnostic():
             "database": {"total_alerts": alert_count},
             "session": session_stats,
             "interface": CAPTURE_INTERFACE,
+            "remote_response": {
+                "enabled": _remote_response_enabled(),
+                "host": settings.REMOTE_RESPONSE_HOST if settings.REMOTE_RESPONSE_ENABLED else "",
+                "user": settings.REMOTE_RESPONSE_USER if settings.REMOTE_RESPONSE_ENABLED else "",
+                "backend": settings.REMOTE_RESPONSE_BACKEND if settings.REMOTE_RESPONSE_ENABLED else "",
+            },
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/logs")
+async def get_logs(
+    src_ip: str = Query(None),
+    source: str = Query(None),
+    event_type: str = Query(None),
+    limit: int = Query(200, le=500),
+    offset: int = Query(0, ge=0),
+    minutes: int = Query(60, ge=1, le=1440),
+):
+    from sqlalchemy import select, desc
+    from database import NormalizedLog
+    try:
+        async with AsyncSessionLocal() as s:
+            stmt = select(NormalizedLog)
+            since = datetime.utcnow() - timedelta(minutes=minutes)
+            stmt = stmt.where(NormalizedLog.timestamp >= since)
+            if src_ip:
+                stmt = stmt.where(NormalizedLog.src_ip.ilike(f"%{src_ip}%"))
+            if source:
+                stmt = stmt.where(NormalizedLog.source == source)
+            if event_type:
+                stmt = stmt.where(NormalizedLog.event_type.ilike(f"%{event_type}%"))
+            stmt = stmt.order_by(desc(NormalizedLog.timestamp)).offset(offset).limit(limit)
+            result = await s.execute(stmt)
+            logs = result.scalars().all()
+        return {
+            "logs": [{
+                "id": l.id,
+                "timestamp": l.timestamp.isoformat() + "Z" if l.timestamp else None,
+                "source": str(l.source),
+                "src_ip": l.src_ip,
+                "dst_ip": l.dst_ip,
+                "src_port": l.src_port,
+                "dst_port": l.dst_port,
+                "protocol": l.protocol,
+                "event_type": l.event_type,
+                "predicted_label": l.predicted_label,
+                "confidence": l.confidence,
+                "message": l.message,
+                "extra": l.extra or {},
+            } for l in logs],
+            "total": len(logs),
+        }
+    except Exception as e:
+        return {"error": str(e), "logs": []}
+
+
+@app.get("/api/siem/alerts/{alert_id}/context")
+async def alert_context(alert_id: int):
+    """Return related alerts + raw logs from same source IP for investigation."""
+    from sqlalchemy import select, desc
+    from database import Alert as SiemAlert, NormalizedLog
+    try:
+        async with AsyncSessionLocal() as s:
+            result = await s.execute(select(SiemAlert).where(SiemAlert.id == alert_id))
+            alert = result.scalar_one_or_none()
+            if not alert:
+                raise HTTPException(status_code=404, detail="Alert not found")
+            src_ip = alert.src_ip
+            rel_alerts_r = await s.execute(
+                select(SiemAlert)
+                .where(SiemAlert.src_ip == src_ip)
+                .order_by(SiemAlert.created_at)
+                .limit(50)
+            )
+            related_alerts = rel_alerts_r.scalars().all()
+            rel_logs_r = await s.execute(
+                select(NormalizedLog)
+                .where(NormalizedLog.src_ip == src_ip)
+                .order_by(desc(NormalizedLog.timestamp))
+                .limit(100)
+            )
+            related_logs = rel_logs_r.scalars().all()
+        return {
+            "alert_id": alert_id,
+            "src_ip": src_ip,
+            "related_alerts": [{
+                "id": a.id,
+                "title": a.title,
+                "severity": str(a.severity),
+                "attack_type": a.attack_type,
+                "confidence": a.confidence,
+                "mitre_technique_id": a.mitre_technique_id,
+                "created_at": a.created_at.isoformat() + "Z" if a.created_at else None,
+            } for a in related_alerts],
+            "related_logs": [{
+                "id": l.id,
+                "timestamp": l.timestamp.isoformat() + "Z" if l.timestamp else None,
+                "source": str(l.source),
+                "src_ip": l.src_ip,
+                "dst_ip": l.dst_ip,
+                "src_port": l.src_port,
+                "dst_port": l.dst_port,
+                "protocol": l.protocol,
+                "event_type": l.event_type,
+                "predicted_label": l.predicted_label,
+                "confidence": l.confidence,
+                "message": l.message,
+            } for l in related_logs],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": str(e), "related_alerts": [], "related_logs": []}
+
+
+@app.post("/api/active-defense/check")
+async def active_defense_check(ip: str = Query(...), user_agent: str = Query(None)):
+    """Check if an IP or User-Agent is currently banned."""
+    is_blocked, reason = active_defense.check_and_block(ip, user_agent)
+    return {"ip": ip, "user_agent": user_agent, "is_blocked": is_blocked, "reason": reason}
+
+
+@app.get("/api/active-defense/bans")
+async def active_defense_bans():
+    """List all currently active bans."""
+    return {"bans": active_defense.get_active_bans()}
+
+
+@app.post("/api/active-defense/ban-ip")
+async def active_defense_ban_ip(
+    ip: str = Query(...),
+    reason: str = Query("Manual ban"),
+    ttl: int = Query(600),
+):
+    """Manually ban an IP address with an optional TTL."""
+    if not _is_blockable_ip(ip):
+        raise HTTPException(status_code=400, detail=f"Cannot ban IP: {ip}")
+    entry = active_defense.ban_ip(ip, reason=reason, attack_type="Manual", ttl=ttl)
+    return {"success": True, "ban": entry.to_dict()}
+
+
+@app.get("/api/active-defense/stats")
+async def active_defense_stats():
+    """Return active defense statistics."""
+    return active_defense.get_stats()
 
 
 @app.get("/")

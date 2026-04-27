@@ -43,16 +43,113 @@ WHITELIST_IP_PREFIXES = [
     "146.75.",    # Fastly
     "151.101.",   # Fastly
     # --- NOISE FILTER ---
-    "192.168.1.", # Real Physical Local Wi-Fi network (Home Router / PC)
+    # "192.168.1.", # Real Physical Local Wi-Fi network (Home Router / PC) - DISABLED FOR TESTING
 ]
 
 DYNAMIC_WHITELIST = set()
+
+def _ip_matches_entry(ip: str, entry: str) -> bool:
+    """Exact-match host IPs; only treat entries as prefixes when explicit."""
+    if not ip or not entry:
+        return False
+
+    candidate = entry.strip()
+    if not candidate:
+        return False
+
+    if candidate.endswith('.'):
+        return ip.startswith(candidate)
+
+    if '/' in candidate:
+        try:
+            import ipaddress
+            return ipaddress.ip_address(ip) in ipaddress.ip_network(candidate, strict=False)
+        except ValueError:
+            return False
+
+    return ip == candidate
 
 def update_trusted_ips_cache(ips):
     global DYNAMIC_WHITELIST
     DYNAMIC_WHITELIST.clear()
     for ip in ips:
-        DYNAMIC_WHITELIST.add(ip)
+        if ip:
+            clean_ip = ip.strip()
+            DYNAMIC_WHITELIST.add(clean_ip)
+    print(f"[*] Memory Whitelist Synced: {list(DYNAMIC_WHITELIST)}")
+
+# ============================================================================
+# ACTIVE DEFENSE: DYNAMIC BAN LIST (IPs & USER-AGENTS)
+# ============================================================================
+import time
+import subprocess
+import threading
+
+class ActiveDefenseCache:
+    def __init__(self):
+        self.banned_ips = {}           # { ip: expiration_time }
+        self.banned_user_agents = {}   # { ua: expiration_time }
+        self.banned_sessions = {}      # { session_id: expiration_time }
+        self.block_duration = 3600     # 1 hour default block
+
+    def _block_ip_windows_firewall(self, ip: str):
+        def _run_rule():
+            try:
+                rule_name = f"SentinelIQ_Block_{ip.replace('.', '_')}"
+                # Delete any existing rule with same name first
+                del_cmd = f'netsh advfirewall firewall delete rule name="{rule_name}"'
+                subprocess.run(del_cmd, shell=True, capture_output=True)
+                
+                # Create the new block rule for both inbound and outbound
+                add_cmd = f'netsh advfirewall firewall add rule name="{rule_name}" dir=in action=block remoteip={ip}'
+                subprocess.run(add_cmd, shell=True, capture_output=True)
+                print(f"[🛡️ FIREWALL] Successfully created physical Windows Firewall block rule for {ip}")
+            except Exception as e:
+                print(f"[!] Firewall block failed for {ip} (Needs Admin Privileges). Error: {e}")
+                
+        threading.Thread(target=_run_rule, daemon=True).start()
+
+    def ban_ip(self, ip: str, duration: int = None):
+        if not ip or ip in DYNAMIC_WHITELIST: return
+        self.banned_ips[ip] = time.time() + (duration or self.block_duration)
+        print(f"[🛡️ ActiveDefense] BANNED IP: {ip} for {(duration or self.block_duration)//60} minutes")
+        self._block_ip_windows_firewall(ip)
+
+    def ban_user_agent(self, ua: str, duration: int = None):
+        if not ua or len(ua) < 5: return
+        self.banned_user_agents[ua] = time.time() + (duration or self.block_duration)
+        print(f"[🛡️ ActiveDefense] BANNED USER-AGENT: {ua} for {(duration or self.block_duration)//60} minutes")
+
+    def ban_session(self, session_id: str, duration: int = None):
+        if not session_id: return
+        self.banned_sessions[session_id] = time.time() + (duration or self.block_duration)
+        print(f"[🛡️ ActiveDefense] BANNED SESSION: {session_id} for {(duration or self.block_duration)//60} minutes")
+
+    def is_banned(self, ip: str, ua: str = "", session_id: str = "") -> bool:
+        now = time.time()
+        # Clean expired TTLs lazily and check
+        if ip in self.banned_ips:
+            if now > self.banned_ips[ip]:
+                del self.banned_ips[ip]
+            else:
+                return True
+                
+        if ua and ua in self.banned_user_agents:
+            if now > self.banned_user_agents[ua]:
+                del self.banned_user_agents[ua]
+            else:
+                return True
+                
+        if session_id and session_id in self.banned_sessions:
+            if now > self.banned_sessions[session_id]:
+                del self.banned_sessions[session_id]
+            else:
+                return True
+                
+        return False
+
+# Global instance for active defense
+active_defense = ActiveDefenseCache()
 
 # ============================================================================
 # SINGLE is_benign_system_traffic — merged whitelist + port rules
@@ -71,12 +168,20 @@ def is_benign_system_traffic(flow_info: dict) -> bool:
 
     # ── 1. Check known CDN/DNS/Service subnets + DYNAMIC DB IPS
     for pfx in WHITELIST_IP_PREFIXES:
-        if src_ip.startswith(pfx) or dst_ip.startswith(pfx):
+        if _ip_matches_entry(src_ip, pfx) or _ip_matches_entry(dst_ip, pfx):
             return True
             
     for pfx in DYNAMIC_WHITELIST:
-        if src_ip.startswith(pfx) or dst_ip.startswith(pfx):
+        if _ip_matches_entry(src_ip, pfx) or _ip_matches_entry(dst_ip, pfx):
             return True
+
+    # ── 1.5. CHECK ACTIVE BANS (DROP IMMEDIATELY IF BANNED)
+    # Using 'is_benign_system_traffic' conceptually means "Skip Analysis".
+    # If it's banned, we SKIP analysis to drop it (we already alerted on it previously).
+    ua = flow_info.get('extra', {}).get('user_agent', '') if 'extra' in flow_info else flow_info.get('user_agent', '')
+    session = flow_info.get('extra', {}).get('session_id', '') if 'extra' in flow_info else flow_info.get('session_id', '')
+    if active_defense.is_banned(ip=src_ip, ua=ua, session_id=session):
+        return True # Drop it (Treat it as 'processed' so it makes no noise)
 
     # ── 2. DNS traffic ───────────────────────────────────────
     if src_port == 53 or dst_port == 53:
@@ -131,14 +236,27 @@ def post_process_prediction(label, score, flow_info):
     if (src_port == 53 or dst_port == 53) and ('DoS' in label or 'Slow' in label):
         return "BENIGN", 0.05
 
-    # HTTPS with few packets is not DoS
-    if dst_port == 443 and packet_count < 20 and 'DoS' in label:
-        if score < 0.92:
+    # HTTPS with very few packets is probably not DoS (but keep a low bar)
+    if dst_port == 443 and packet_count < 5 and 'DoS' in label:
+        if score < 0.85:
             return "BENIGN", score * 0.3
 
-    # Router IPs need very high confidence
+    # Short web-port flows look like DoS/Bot to the ML model but are really
+    # directory brute-force (Gobuster, DirBuster, ffuf). Each connection is a
+    # tiny HTTP GET (< 15 packets). Real HTTP DoS flows are much longer.
+    # The nginx log path (R017 scanner UA, R018 4xx) will fire the correct alert.
+    if dst_port in (80, 443, 8080, 8443) and packet_count < 15:
+        if 'DoS' in label or 'DDoS' in label or label == 'Bot':
+            return "BENIGN", score * 0.15
+
+    # Router IPs need very high confidence for noisy traffic but NOT for DDoS
+    # Router IPs need very high confidence for noisy traffic
     if src_ip.endswith('.254') or src_ip.endswith('.1'):
-        if score < 0.95:
+        # For DoS/DDoS from router, we need extreme confidence to avoid false positives from gateway maintenance
+        if 'DoS' in label or 'DDoS' in label:
+            if score < 0.98:
+                return "BENIGN", score * 0.1
+        elif score < 0.95:
             return "BENIGN", score * 0.5
 
     # FTP brute force must target port 21
@@ -168,16 +286,27 @@ def post_process_prediction(label, score, flow_info):
 # ALERT DECISION
 # ============================================================================
 
+# ============================================================================
+# ALERT DECISION
+# ============================================================================
+
 def should_generate_alert(label, score, flow_info, min_score=0.85):
     """Returns True if an alert should be generated for this prediction."""
     if label.upper() == "BENIGN":
         return False
     if score < min_score:
         return False
-    if ('DoS' in label or 'DDoS' in label) and flow_info.get('packet_count', 0) < 50:
+        
+    packet_count = flow_info.get('packet_count', 0)
+    
+    # Require at least 3 packets for heavy attacks to filter single-packet glitches
+    if ('DoS' in label or 'DDoS' in label) and packet_count < 3:
         return False
-    if 'PortScan' in label and flow_info.get('packet_count', 0) < 10:
+        
+    # Require at least 2 packets for PortScan to avoid single SYN spikes
+    if 'PortScan' in label and packet_count < 2:
         return False
+        
     return True
 
 
