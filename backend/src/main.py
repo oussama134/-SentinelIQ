@@ -1,4 +1,11 @@
-# main.py - SentinelIQ SIEM Backend
+"""
+SentinelIQ backend application entrypoint.
+
+This FastAPI service ties together log ingestion, PCAP-based ML detection,
+correlation, MITRE enrichment, threat intel, alerting, and active response
+behind one API used by the dashboard and remote collection agents.
+"""
+
 import os
 import sys
 import subprocess
@@ -45,6 +52,8 @@ from core.correlation import engine as correlation_engine
 from core.mitre import get_mitre_mapping, EVENT_TYPE_MAPPINGS
 from core.threat_intel import threat_intel
 from core.active_defense import active_defense
+from core.kill_switch import trigger as ks_trigger, get_audit_log as ks_log, lift_isolation
+from core.correlation import KILL_SWITCH_RULE_IDS
 
 
 # ── SMTP / Background ──────────────────────────────────────────
@@ -53,33 +62,73 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from fastapi import BackgroundTasks
 
+_email_last_sent: dict[str, float] = {}   # src_ip → last email timestamp
+_EMAIL_COOLDOWN_SECS = 600               # one email per IP per 10 minutes
+
 def send_alert_email(alert_data: Alert, ip_country: str):
     if not settings.SMTP_USER or not settings.SMTP_PASSWORD:
         return
+    ip_key = getattr(alert_data, "src_ip", None) or "unknown"
+    now = time.time()
+    if now - _email_last_sent.get(ip_key, 0) < _EMAIL_COOLDOWN_SECS:
+        return
+    _email_last_sent[ip_key] = now
     try:
+        dst  = getattr(alert_data, "dst_ip",   None) or "?"
+        dev  = getattr(alert_data, "device_id", None) or "windows-siem"
+        conf = getattr(alert_data, "confidence", 0) or 0
+        sev  = str(getattr(alert_data, "severity", "CRITICAL")).replace("SeverityLevel.", "")
+
         msg = MIMEMultipart()
         msg['From'] = settings.SMTP_USER
-        msg['To'] = settings.SMTP_USER
-        msg['Subject'] = f"[ALERT] CRITICAL ALERT: {alert_data.attack_type} detected!"
-        
+        msg['To']   = settings.SMTP_USER
+        # Subject: attack type + direction so the victim machine is visible at a glance
+        msg['Subject'] = (
+            f"[SentinelIQ] {sev} — {alert_data.attack_type} | "
+            f"{alert_data.src_ip} → {dst} | device: {dev}"
+        )
+
         html = f"""
-        <html><body>
-          <h2 style='color: #f85149;'>SentinelIQ Critical Attack Detected [ALERT]</h2>
-          <p><strong>Title:</strong> {alert_data.title}</p>
-          <p><strong>Attack Type:</strong> {alert_data.attack_type}</p>
-          <p><strong>Source IP:</strong> {alert_data.src_ip} {ip_country}</p>
-          <p><strong>Confidence:</strong> {str(alert_data.confidence)}</p>
-          <p style='margin-top:20px; font-size:12px; color:gray;'>Action required on dashboard: http://localhost:3000</p>
+        <html><body style='font-family:monospace;background:#0d1117;color:#c9d1d9;padding:24px'>
+          <div style='border-left:4px solid #f85149;padding-left:16px;margin-bottom:20px'>
+            <h2 style='color:#f85149;margin:0 0 4px'>SentinelIQ — Critical Alert</h2>
+            <span style='color:#6e7681;font-size:12px'>{datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")} UTC</span>
+          </div>
+
+          <table style='border-collapse:collapse;width:100%;max-width:560px'>
+            <tr><td style='padding:6px 12px;color:#6e7681;width:160px'>Attack Type</td>
+                <td style='padding:6px 12px;color:#f85149;font-weight:bold'>{alert_data.attack_type}</td></tr>
+            <tr style='background:#161b22'><td style='padding:6px 12px;color:#6e7681'>Severity</td>
+                <td style='padding:6px 12px;color:#f85149'>{sev}</td></tr>
+            <tr><td style='padding:6px 12px;color:#6e7681'>Title</td>
+                <td style='padding:6px 12px'>{alert_data.title}</td></tr>
+            <tr style='background:#161b22'><td style='padding:6px 12px;color:#6e7681'>Source IP</td>
+                <td style='padding:6px 12px;color:#58a6ff;font-weight:bold'>{alert_data.src_ip}&nbsp;{ip_country}</td></tr>
+            <tr><td style='padding:6px 12px;color:#6e7681'>Destination IP</td>
+                <td style='padding:6px 12px;color:#f0883e;font-weight:bold'>{dst}</td></tr>
+            <tr style='background:#161b22'><td style='padding:6px 12px;color:#6e7681'>Targeted Device</td>
+                <td style='padding:6px 12px;color:#d29922'>{dev}</td></tr>
+            <tr><td style='padding:6px 12px;color:#6e7681'>Confidence</td>
+                <td style='padding:6px 12px'>{round(conf * 100)}%</td></tr>
+            <tr style='background:#161b22'><td style='padding:6px 12px;color:#6e7681'>MITRE Tactic</td>
+                <td style='padding:6px 12px'>{getattr(alert_data, "mitre_tactic", "") or "—"}</td></tr>
+            <tr><td style='padding:6px 12px;color:#6e7681'>MITRE Technique</td>
+                <td style='padding:6px 12px'>{getattr(alert_data, "mitre_technique_id", "") or "—"}</td></tr>
+          </table>
+
+          <p style='margin-top:24px;font-size:11px;color:#6e7681'>
+            Investigate → <a href='http://localhost:3000' style='color:#58a6ff'>SentinelIQ Dashboard</a>
+          </p>
         </body></html>
         """
         msg.attach(MIMEText(html, 'html'))
-        
+
         server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT)
         server.starttls()
         server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
         server.send_message(msg)
         server.quit()
-        print(f"[*] Critical Alert Email sent to {settings.SMTP_USER}")
+        print(f"[*] Alert email → {settings.SMTP_USER} | {alert_data.src_ip} → {dst} [{dev}]")
     except Exception as e:
         print(f"[!] Failed to send email: {str(e)}")
 
@@ -152,8 +201,48 @@ def run_async(coro):
         return loop.run_until_complete(coro)
 
 
-def _ban_ip_safely(ip: str, attack_type: str, reason: str):
-    """Keep active defense failures from breaking alert persistence."""
+def _maybe_trigger_kill_switch(rule_id: str, src_ip: str, reason: str):
+    """Fire the kill switch when a ransomware rule (R030/R031) fires."""
+    if rule_id not in KILL_SWITCH_RULE_IDS:
+        return
+    if not settings.KILL_SWITCH_ENABLED:
+        print(f"[KILL SWITCH] Rule {rule_id} fired — KILL_SWITCH_ENABLED=False, skipping")
+        print(f"[KILL SWITCH] Set KILL_SWITCH_ENABLED=True in .env to arm")
+        return
+    if not settings.REMOTE_RESPONSE_HOST:
+        print(f"[KILL SWITCH] Rule {rule_id} fired — no REMOTE_RESPONSE_HOST configured")
+        return
+    ks_trigger(
+        action=settings.KILL_SWITCH_ACTION,
+        host=settings.REMOTE_RESPONSE_HOST,
+        user=settings.REMOTE_RESPONSE_USER,
+        port=settings.REMOTE_RESPONSE_PORT,
+        identity_file=settings.REMOTE_RESPONSE_IDENTITY_FILE or None,
+        use_sudo=settings.REMOTE_RESPONSE_USE_SUDO,
+        reason=f"[{rule_id}] {reason} (attacker: {src_ip})",
+    )
+
+
+# ── Active Defense global on/off toggle ──────────────────────────────────────
+_active_defense_on: bool = True
+
+# Per-device defense toggle. Key = device_id, value = True/False.
+# Devices not in this dict inherit the global _active_defense_on setting.
+_device_defense_enabled: dict[str, bool] = {}
+
+
+def _is_defense_on(device_id: str = "") -> bool:
+    """Return True if active defense should fire for this device."""
+    if not _active_defense_on:
+        return False
+    if device_id and device_id in _device_defense_enabled:
+        return _device_defense_enabled[device_id]
+    return True
+
+
+def _ban_ip_safely(ip: str, attack_type: str, reason: str, device_id: str = ""):
+    if not _is_defense_on(device_id):
+        return
     try:
         active_defense.ban_ip(ip, reason=reason, attack_type=attack_type)
     except Exception as e:
@@ -161,8 +250,7 @@ def _ban_ip_safely(ip: str, attack_type: str, reason: str):
 
 
 def _ban_user_agent_safely(user_agent: str, attack_type: str, reason: str):
-    """Keep active defense failures from breaking alert persistence."""
-    if not user_agent:
+    if not user_agent or not _active_defense_on:
         return
     try:
         active_defense.ban_user_agent(user_agent, reason=reason, attack_type=attack_type)
@@ -173,7 +261,9 @@ def _ban_user_agent_safely(user_agent: str, attack_type: str, reason: str):
 def _is_blockable_ip(ip: str) -> bool:
     if not ip or ip in {"0.0.0.0", "localhost", "multiple"}:
         return False
-    return not ip.startswith("127.")
+    if ip.startswith("127.") or ip.startswith("192.168.1."):
+        return False  # never ban the SIEM's own local network
+    return True
 
 
 def _firewall_rule_name(ip: str) -> str:
@@ -195,7 +285,7 @@ if not _RUNNING_AS_ADMIN:
 
 def _apply_windows_firewall_block(ip: str) -> bool:
     """Best-effort host firewall block for the SentinelIQ machine itself."""
-    if not _is_blockable_ip(ip):
+    if not _active_defense_on or not _is_blockable_ip(ip):
         return False
 
     if not _RUNNING_AS_ADMIN:
@@ -288,8 +378,28 @@ def _build_remote_ubuntu_command(ip: str, action: str) -> str:
     )
 
 
+def _run_remote_ubuntu_flush() -> bool:
+    """Flush the INPUT chain on Ubuntu — removes all SentinelIQ blocks at once."""
+    if not _remote_response_enabled():
+        return False
+    sudo_prefix = "sudo -n " if settings.REMOTE_RESPONSE_USE_SUDO else ""
+    backend = (settings.REMOTE_RESPONSE_BACKEND or "iptables").strip().lower()
+    if backend == "ufw":
+        cmd = f"{sudo_prefix}bash -lc \"yes | ufw reset && ufw --force enable\""
+    else:
+        cmd = f"{sudo_prefix}bash -lc \"iptables -F INPUT\""
+    ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+               "-p", str(settings.REMOTE_RESPONSE_PORT)]
+    if settings.REMOTE_RESPONSE_IDENTITY_FILE:
+        ssh_cmd.extend(["-i", settings.REMOTE_RESPONSE_IDENTITY_FILE])
+    ssh_cmd.append(f"{settings.REMOTE_RESPONSE_USER}@{settings.REMOTE_RESPONSE_HOST}")
+    ssh_cmd.append(cmd)
+    proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=20)
+    return proc.returncode == 0
+
+
 def _run_remote_ubuntu_firewall_action(ip: str, action: str):
-    if not _remote_response_enabled() or not _is_blockable_ip(ip):
+    if not _active_defense_on or not _remote_response_enabled() or not _is_blockable_ip(ip):
         return
 
     safe_ip = str(ipaddress.ip_address(ip))
@@ -392,7 +502,7 @@ def process_thread():
 # ASYNC DB SAVE
 # =============================================================================
 
-async def _save_alerts_to_postgres(triggered_alerts, unified_log):
+async def _save_alerts_to_postgres(triggered_alerts, unified_log, device_id: str = ""):
     async with AsyncSessionLocal() as db_session:
         db_log = NormalizedLog(
             source="NETWORK",
@@ -428,19 +538,24 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log):
                 ip_abuse_score=enrichment.abuse_score,
                 is_known_malicious=enrichment.is_known_malicious,
                 raw_log_id=db_log.id,
+                device_id=device_id or None,
             )
             db_session.add(db_alert)
             await db_session.flush()
-            
+
             # Email for CRITICAL; active defense for CRITICAL + HIGH
             if db_alert.severity == SeverityLevel.CRITICAL:
                 Thread(target=send_alert_email, args=(db_alert, enrichment.country_code or ''), daemon=True).start()
+                _maybe_trigger_kill_switch(
+                    db_alert.rule_id, db_alert.src_ip, db_alert.title
+                )
 
             if db_alert.severity in (SeverityLevel.CRITICAL, SeverityLevel.HIGH):
                 _ban_ip_safely(
                     db_alert.src_ip,
                     attack_type=db_alert.attack_type,
                     reason=f"{db_alert.severity} alert auto-ban: {db_alert.title}",
+                    device_id=device_id,
                 )
                 firewall_reason = f"{db_alert.severity} auto-block: {db_alert.title}"
                 firewall_applied = _apply_windows_firewall_block(db_alert.src_ip)
@@ -461,7 +576,7 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log):
         await db_session.commit()
 
 
-async def _evaluate_and_save_log_event(event) -> bool:
+async def _evaluate_and_save_log_event(event, device_id: str = "") -> bool:
     """Run a ParsedLogEvent through the correlation engine and persist to DB."""
     try:
         _src_map = {
@@ -520,6 +635,7 @@ async def _evaluate_and_save_log_event(event) -> bool:
                     ip_abuse_score=enrichment.abuse_score,
                     is_known_malicious=enrichment.is_known_malicious,
                     raw_log_id=db_log.id,
+                    device_id=device_id or None,
                 )
                 db_session.add(row)
                 await db_session.flush()
@@ -528,10 +644,12 @@ async def _evaluate_and_save_log_event(event) -> bool:
 
                 if row.severity == SeverityLevel.CRITICAL:
                     Thread(target=send_alert_email, args=(row, enrichment.country_code or ''), daemon=True).start()
+                    _maybe_trigger_kill_switch(row.rule_id, row.src_ip, row.title)
 
                 if row.severity in (SeverityLevel.CRITICAL, SeverityLevel.HIGH):
                     _ban_ip_safely(event.src_ip, attack_type=attack_type,
-                                   reason=f"{row.severity} log alert auto-ban: {title}")
+                                   reason=f"{row.severity} log alert auto-ban: {title}",
+                                   device_id=device_id)
                     fw_ok = _apply_windows_firewall_block(event.src_ip)
                     if fw_ok:
                         await _upsert_blocked_ip_record(
@@ -565,7 +683,7 @@ _rb_state = {
     "ssh_attempts":      _dd(int),
     "ftp_attempts":      _dd(int),
     "bot_ports":         _dd(int),
-    "http_reqs":         _dd(int),
+    "http_reqs":         _dd(int),   # persistent HTTP flood counter (DoS Hulk)
     "ua_reqs":           _dd(int),
     "last_alert":        _dd(float),
 }
@@ -580,7 +698,7 @@ def _rb_can_alert(key: str) -> bool:
     return False
 
 
-def _rule_based_detect(flow_metadata: list, ts: str):
+def _rule_based_detect(flow_metadata: list, ts: str, device_id: str = ""):
     C2_PORTS = {6667, 6668, 6669, 4444, 8080, 9090, 1080, 5555, 31337}
     FLOOD_PKT_THRESHOLD = 200   # packets from one source in a 10s window → flood
 
@@ -632,6 +750,14 @@ def _rule_based_detect(flow_metadata: list, ts: str):
     for src, n in ftp_hits.items():  _rb_state["ftp_attempts"][src] += n
     for src, n in bot_hits.items():  _rb_state["bot_ports"][src]    += n
 
+    # ── Memory guard: prune oldest 250 IPs when dict exceeds 500 ────
+    if len(_rb_state["dst_ports_per_src"]) > 500:
+        for stale in list(_rb_state["dst_ports_per_src"])[:250]:
+            del _rb_state["dst_ports_per_src"][stale]
+            _rb_state["ssh_attempts"].pop(stale, None)
+            _rb_state["ftp_attempts"].pop(stale, None)
+            _rb_state["bot_ports"].pop(stale, None)
+
     # ── Alert-firing helper ───────────────────────────────────────
     def _rb_fire(src_ip, label, event_type, conf, reason, dst_ip=None):
         try:
@@ -644,7 +770,7 @@ def _rule_based_detect(flow_metadata: list, ts: str):
             )
             triggered = correlation_engine.process_log(log)
             if triggered:
-                run_async(_save_alerts_to_postgres(triggered, log))
+                run_async(_save_alerts_to_postgres(triggered, log, device_id))
                 for a in triggered:
                     traffic_stats.record_alert()
                     print(f"[{ts}] [ALERT] RB-{event_type}: {a.title} | {a.rule.severity}")
@@ -657,26 +783,42 @@ def _rule_based_detect(flow_metadata: list, ts: str):
             print(f"[{ts}] [ALERT] Packet flood: {src} sent {n} pkts in window")
             _rb_fire(src, "DDoS", "ddos", 0.88, f"pkt_flood:{n}")
 
+    # ── HTTP flood (DoS Hulk) — separate key so DDoS doesn't crowd it out ─────
+    for src, n in http_hits.items():
+        _rb_state["http_reqs"][src] += n
+    for src, n in list(_rb_state["http_reqs"].items()):
+        if n >= 80 and _rb_can_alert(f"http_flood:{src}"):
+            print(f"[{ts}] [ALERT] HTTP flood: {src} → {n} GET reqs in window")
+            _rb_fire(src, "DoS Hulk", "dos_hulk", 0.87, f"http_flood:{n}")
+            _rb_state["http_reqs"][src] = 0
+
     # ── Port scan ─────────────────────────────────────────────────
     for src, ports in list(_rb_state["dst_ports_per_src"].items()):
         if len(ports) >= 30 and _rb_can_alert(f"scan:{src}"):
             print(f"[{ts}] [ALERT] Port scan: {src} → {len(ports)} ports")
             _rb_fire(src, "PortScan", "port_scan", 0.85, f"portscan:{len(ports)}")
-            _rb_state["dst_ports_per_src"][src].clear()  # reset so it doesn't re-fire on empty windows
+            _rb_state["dst_ports_per_src"][src].clear()
 
     # ── SSH brute force ───────────────────────────────────────────
     for src, n in list(_rb_state["ssh_attempts"].items()):
         if n >= 5 and _rb_can_alert(f"ssh:{src}"):
             print(f"[{ts}] [ALERT] SSH brute force: {src} → {n} attempts")
             _rb_fire(src, "SSH-Patator", "ssh_brute_force", 0.85, f"ssh_bf:{n}")
-            _rb_state["ssh_attempts"][src] = 0  # reset so it doesn't re-fire on empty windows
+            _rb_state["ssh_attempts"][src] = 0
 
     # ── FTP brute force ───────────────────────────────────────────
     for src, n in list(_rb_state["ftp_attempts"].items()):
         if n >= 5 and _rb_can_alert(f"ftp:{src}"):
             print(f"[{ts}] [ALERT] FTP brute force: {src} → {n} attempts")
             _rb_fire(src, "FTP-Patator", "ftp_brute_force", 0.85, f"ftp_bf:{n}")
-            _rb_state["ftp_attempts"][src] = 0  # reset so it doesn't re-fire on empty windows
+            _rb_state["ftp_attempts"][src] = 0
+
+    # ── C2 / Botnet beaconing ─────────────────────────────────────
+    for src, n in list(_rb_state["bot_ports"].items()):
+        if n >= 5 and _rb_can_alert(f"bot:{src}"):
+            print(f"[{ts}] [ALERT] C2 beaconing: {src} → {n} C2-port connections")
+            _rb_fire(src, "Bot", "botnet_activity", 0.82, f"c2_beacon:{n}")
+            _rb_state["bot_ports"][src] = 0
 
 
 def _process_pcap(pcap_file: str):
@@ -763,7 +905,7 @@ def _process_pcap(pcap_file: str):
                     triggered = correlation_engine.process_log(unified_log)
 
                     if triggered:
-                        run_async(_save_alerts_to_postgres(triggered, unified_log))
+                        run_async(_save_alerts_to_postgres(triggered, unified_log, ""))
                         for a in triggered:
                             traffic_stats.record_alert()
                             print(f"[{timestamp}] [ALERT] SIEM: {a.title} | {a.mitre_technique_id} | {a.rule.severity}")
@@ -798,9 +940,11 @@ def _process_pcap(pcap_file: str):
 class LogEntry(PydanticBase):
     source: str
     raw: str
+    device_id: str = ""
 
 class BulkLogRequest(PydanticBase):
     logs: list[LogEntry]
+    device_id: str = ""   # device that sent this batch; overrides per-entry if set
 
 
 @app.post("/api/logs/ingest")
@@ -821,7 +965,7 @@ async def ingest_log(entry: LogEntry):
     if not event:
         return {"status": "skipped", "reason": "unrecognized or benign"}
 
-    fired = await _evaluate_and_save_log_event(event)
+    fired = await _evaluate_and_save_log_event(event, entry.device_id)
     return {
         "status": "alert_fired" if fired else "ingested",
         "event_type": event.event_type,
@@ -832,6 +976,8 @@ async def ingest_log(entry: LogEntry):
 @app.post("/api/logs/ingest/bulk")
 async def ingest_bulk(request: BulkLogRequest):
     """Ingest multiple log lines at once."""
+    if len(request.logs) > 500:
+        raise HTTPException(status_code=413, detail=f"Batch too large: {len(request.logs)} logs (max 500)")
     results = {"received": len(request.logs), "parsed": 0, "alerts_fired": 0, "skipped": 0}
 
     if _log_parser is None:
@@ -856,8 +1002,9 @@ async def ingest_bulk(request: BulkLogRequest):
 
     # Process every event individually so the correlation engine counts
     # each occurrence — the AlertSuppressor prevents alert storms.
+    bulk_device_id = request.device_id
     for ev in parsed_events:
-        if await _evaluate_and_save_log_event(ev):
+        if await _evaluate_and_save_log_event(ev, bulk_device_id):
             results["alerts_fired"] += 1
 
     return {"status": "ok", **results}
@@ -882,7 +1029,8 @@ async def siem_alerts(
     limit: int = Query(100, le=500),
     attack_type: str = Query(None),
     src_ip: str = Query(None),
-    minutes: int = Query(None, ge=1, le=1440)  # [OK] NEW
+    device_id: str = Query(None),
+    minutes: int = Query(None, ge=1, le=1440)
 ):
     from sqlalchemy import select, desc
     from database import Alert as SiemAlert, BlockedIP
@@ -902,6 +1050,8 @@ async def siem_alerts(
                 stmt = stmt.where(SiemAlert.attack_type.ilike(f"%{attack_type}%"))
             if src_ip:
                 stmt = stmt.where(SiemAlert.src_ip.ilike(f"%{src_ip}%"))
+            if device_id:
+                stmt = stmt.where(SiemAlert.device_id == device_id)
 
             result = await s.execute(stmt.limit(limit))
             alerts = result.scalars().all()
@@ -926,6 +1076,7 @@ async def siem_alerts(
                 "ip_country": a.ip_country,
                 "ip_isp": a.ip_isp,
                 "ip_abuse_score": a.ip_abuse_score,
+                "device_id": a.device_id or "",
 
                 # [OK] FIX: always UTC ISO
                 "created_at": a.created_at.replace(tzinfo=None).isoformat() + "Z"
@@ -1070,13 +1221,16 @@ async def ingest_pcap_from_ubuntu(request: Request):
     if len(data) < 25:
         return {"status": "skipped", "reason": "payload too small"}
 
+    pcap_device_id = request.headers.get("X-Device-ID", "")
+
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".pcap", delete=False, dir=_DATA_DIR) as tmp:
         tmp.write(data)
         tmp_path = tmp.name
 
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] [REMOTE PCAP] Received {len(data)//1024}KB from Ubuntu forwarder")
+    device_tag = f" [{pcap_device_id}]" if pcap_device_id else ""
+    print(f"[{ts}] [REMOTE PCAP]{device_tag} Received {len(data)//1024}KB from Ubuntu forwarder")
 
     attack_counts: dict = {}
     flow_metadata = []
@@ -1088,7 +1242,7 @@ async def ingest_pcap_from_ubuntu(request: Request):
 
         if df.empty:
             # No flows extracted — still run rule-based on raw metadata
-            _rule_based_detect(flow_metadata, ts)
+            _rule_based_detect(flow_metadata, ts, pcap_device_id)
             return {"status": "ok", "flows": 0, "attacks": {}}
 
         # ── Flood fast-path ────────────────────────────────────────────
@@ -1117,7 +1271,7 @@ async def ingest_pcap_from_ubuntu(request: Request):
                         )
                         triggered = correlation_engine.process_log(log)
                         if triggered:
-                            run_async(_save_alerts_to_postgres(triggered, log))
+                            run_async(_save_alerts_to_postgres(triggered, log, pcap_device_id))
                             for a in triggered:
                                 traffic_stats.record_alert()
                                 print(f"[{ts}] [ALERT] FLOOD: {a.title} | {a.rule.severity}")
@@ -1157,7 +1311,7 @@ async def ingest_pcap_from_ubuntu(request: Request):
                     )
                     triggered = correlation_engine.process_log(unified_log)
                     if triggered:
-                        run_async(_save_alerts_to_postgres(triggered, unified_log))
+                        run_async(_save_alerts_to_postgres(triggered, unified_log, pcap_device_id))
                         for a in triggered:
                             traffic_stats.record_alert()
                             print(f"[{ts}] [ALERT] REMOTE: {a.title} | {a.rule.severity}")
@@ -1171,7 +1325,7 @@ async def ingest_pcap_from_ubuntu(request: Request):
             print(f"[{ts}] [REMOTE RED] ATTACKS: {attack_counts}")
 
         # ── Rule-based layer (catches what ML misses) ──────────────────
-        _rule_based_detect(flow_metadata, ts)
+        _rule_based_detect(flow_metadata, ts, pcap_device_id)
 
     except Exception as e:
         print(f"[{ts}] [!] Remote pcap processing error: {e}")
@@ -1439,6 +1593,192 @@ async def alert_context(alert_id: int):
         return {"error": str(e), "related_alerts": [], "related_logs": []}
 
 
+@app.get("/api/active-defense/enabled")
+async def get_active_defense_enabled():
+    return {"enabled": _active_defense_on}
+
+
+@app.post("/api/active-defense/toggle")
+async def toggle_active_defense():
+    global _active_defense_on
+    _active_defense_on = not _active_defense_on
+    state = "ENABLED" if _active_defense_on else "DISABLED"
+    print(f"[ACTIVE DEFENSE] {state} by user via dashboard")
+    return {"enabled": _active_defense_on}
+
+
+@app.post("/api/active-defense/flush-all")
+async def flush_all_blocks():
+    """
+    Remove every active ban: memory, DB, Windows Firewall, Ubuntu iptables.
+    Equivalent to 'iptables -F INPUT' on Ubuntu + clearing all local state.
+    """
+    from sqlalchemy import delete as sa_delete
+    from database import BlockedIP
+
+    # 1. Clear in-memory bans (both IP and UA)
+    with active_defense._lock:
+        banned_ips = list(active_defense._ip_bans.keys())
+        active_defense._ip_bans.clear()
+        active_defense._ua_bans.clear()
+
+    # 2. Trigger unban callbacks so Ubuntu iptables rules are removed individually
+    for ip in banned_ips:
+        try:
+            _run_remote_ubuntu_firewall_action(ip, "unban")
+        except Exception:
+            pass
+
+    # 3. Flush entire INPUT chain on Ubuntu (catch anything we missed)
+    ubuntu_flushed = False
+    try:
+        ubuntu_flushed = _run_remote_ubuntu_flush()
+    except Exception as e:
+        print(f"[!] Remote flush failed: {e}")
+
+    # 4. Remove all Windows Firewall rules created by SentinelIQ
+    win_cleared = False
+    if _RUNNING_AS_ADMIN:
+        try:
+            cmd = 'Get-NetFirewallRule -DisplayName "SentinelIQ Auto Block*" | Remove-NetFirewallRule -ErrorAction SilentlyContinue'
+            subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True, timeout=15)
+            win_cleared = True
+        except Exception as e:
+            print(f"[!] Windows firewall flush failed: {e}")
+
+    # 5. Clear BlockedIP table in DB
+    async with AsyncSessionLocal() as s:
+        await s.execute(sa_delete(BlockedIP))
+        await s.commit()
+
+    print(f"[ACTIVE DEFENSE] FLUSH ALL — {len(banned_ips)} bans cleared | ubuntu={ubuntu_flushed} | win={win_cleared}")
+    return {
+        "success": True,
+        "bans_cleared": len(banned_ips),
+        "ubuntu_iptables_flushed": ubuntu_flushed,
+        "windows_firewall_cleared": win_cleared,
+    }
+
+
+@app.post("/api/active-defense/flush-device")
+async def flush_device_blocks(device_id: str = Query(...)):
+    """
+    Flush active bans for a specific device.
+    device_id="__all__"     → same as flush-all
+    device_id="__windows__" → Windows Firewall only (no Ubuntu SSH)
+    device_id="<name>"      → remove bans that belong to that device's alerts
+                              + remote iptables flush if SSH is configured for it
+    """
+    from sqlalchemy import select as sa_select, delete as sa_delete
+    from database import BlockedIP, Alert as SiemAlert
+
+    if device_id == "__all__":
+        return await flush_all_blocks()
+
+    # Collect IPs that fired alerts on this device
+    async with AsyncSessionLocal() as s:
+        if device_id == "__windows__":
+            # All currently banned IPs (we only touch Windows Firewall)
+            result = await s.execute(sa_select(BlockedIP.ip_address))
+            target_ips = [r[0] for r in result.all()]
+        else:
+            result = await s.execute(
+                sa_select(SiemAlert.src_ip)
+                .where(SiemAlert.device_id == device_id)
+                .distinct()
+            )
+            target_ips = [r[0] for r in result.all() if r[0]]
+
+    cleared_win = 0
+    cleared_ubuntu = 0
+
+    for ip in target_ips:
+        # Remove from in-memory ban cache
+        active_defense.unban_ip(ip)
+
+        # Remove Windows Firewall rule
+        try:
+            rule = f"SentinelIQ_Block_{ip.replace('.', '_')}"
+            subprocess.run(
+                f'netsh advfirewall firewall delete rule name="{rule}"',
+                shell=True, capture_output=True
+            )
+            cleared_win += 1
+        except Exception:
+            pass
+
+        # Remote iptables unban — only when this device matches the configured SSH host
+        if device_id != "__windows__" and _remote_response_enabled():
+            try:
+                _run_remote_ubuntu_firewall_action(ip, "unban")
+                cleared_ubuntu += 1
+            except Exception:
+                pass
+
+    # Remove from BlockedIP table
+    async with AsyncSessionLocal() as s:
+        if device_id == "__windows__":
+            await s.execute(sa_delete(BlockedIP))
+        else:
+            from sqlalchemy import and_
+            await s.execute(
+                sa_delete(BlockedIP).where(BlockedIP.ip_address.in_(target_ips))
+            )
+        await s.commit()
+
+    print(f"[ACTIVE DEFENSE] FLUSH [{device_id}] — {len(target_ips)} IPs | win={cleared_win} | ubuntu={cleared_ubuntu}")
+    return {
+        "success": True,
+        "device_id": device_id,
+        "ips_cleared": len(target_ips),
+        "windows_firewall_cleared": cleared_win,
+        "ubuntu_iptables_cleared": cleared_ubuntu,
+    }
+
+
+@app.get("/api/active-defense/device-states")
+async def get_device_defense_states():
+    """Return global + per-device active defense toggle states."""
+    from sqlalchemy import select as sa_select
+    from database import Alert as SiemAlert
+
+    # Collect distinct device_ids that have ever sent alerts
+    async with AsyncSessionLocal() as s:
+        result = await s.execute(
+            sa_select(SiemAlert.device_id).distinct()
+        )
+        db_devices = [r[0] for r in result.all() if r[0]]
+
+    # Merge with in-memory overrides
+    all_devices = sorted(set(db_devices) | set(_device_defense_enabled.keys()))
+    return {
+        "global": _active_defense_on,
+        "devices": [
+            {
+                "device_id": d,
+                "enabled": _device_defense_enabled.get(d, True),
+                "inherits_global": d not in _device_defense_enabled,
+            }
+            for d in all_devices
+        ],
+    }
+
+
+@app.post("/api/active-defense/toggle-device")
+async def toggle_device_defense(device_id: str = Query(...), enabled: bool = Query(...)):
+    """Enable or disable active defense for a specific device."""
+    global _device_defense_enabled
+    if device_id == "__global__":
+        global _active_defense_on
+        _active_defense_on = enabled
+        print(f"[ACTIVE DEFENSE] GLOBAL → {'ENABLED' if enabled else 'DISABLED'}")
+        return {"device_id": "__global__", "enabled": _active_defense_on}
+
+    _device_defense_enabled[device_id] = enabled
+    print(f"[ACTIVE DEFENSE] [{device_id}] → {'ENABLED' if enabled else 'DISABLED'}")
+    return {"device_id": device_id, "enabled": enabled}
+
+
 @app.post("/api/active-defense/check")
 async def active_defense_check(ip: str = Query(...), user_agent: str = Query(None)):
     """Check if an IP or User-Agent is currently banned."""
@@ -1459,6 +1799,10 @@ async def active_defense_ban_ip(
     ttl: int = Query(600),
 ):
     """Manually ban an IP address with an optional TTL."""
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid IP address format: {ip}")
     if not _is_blockable_ip(ip):
         raise HTTPException(status_code=400, detail=f"Cannot ban IP: {ip}")
     entry = active_defense.ban_ip(ip, reason=reason, attack_type="Manual", ttl=ttl)
@@ -1469,6 +1813,86 @@ async def active_defense_ban_ip(
 async def active_defense_stats():
     """Return active defense statistics."""
     return active_defense.get_stats()
+
+
+@app.get("/api/kill-switch/status")
+async def kill_switch_status():
+    """Current kill switch configuration and audit trail."""
+    return {
+        "enabled": settings.KILL_SWITCH_ENABLED,
+        "action":  settings.KILL_SWITCH_ACTION,
+        "target":  settings.REMOTE_RESPONSE_HOST or None,
+        "armed_for_rules": list(KILL_SWITCH_RULE_IDS),
+        "audit_log": ks_log(),
+    }
+
+
+@app.post("/api/kill-switch/test")
+async def kill_switch_test(
+    action: str = Query("isolate", regex="^(isolate|shutdown)$"),
+):
+    """
+    Manually trigger the kill switch for demo/testing purposes.
+    Requires KILL_SWITCH_ENABLED=True and REMOTE_RESPONSE_HOST configured.
+    """
+    if not settings.KILL_SWITCH_ENABLED:
+        raise HTTPException(status_code=403,
+                            detail="Kill switch is disabled. Set KILL_SWITCH_ENABLED=True in .env")
+    if not settings.REMOTE_RESPONSE_HOST:
+        raise HTTPException(status_code=400,
+                            detail="No target configured. Set REMOTE_RESPONSE_HOST in .env")
+    ks_trigger(
+        action=action,
+        host=settings.REMOTE_RESPONSE_HOST,
+        user=settings.REMOTE_RESPONSE_USER,
+        port=settings.REMOTE_RESPONSE_PORT,
+        identity_file=settings.REMOTE_RESPONSE_IDENTITY_FILE or None,
+        use_sudo=settings.REMOTE_RESPONSE_USE_SUDO,
+        reason="Manual test via API",
+    )
+    return {"status": "dispatched", "action": action, "target": settings.REMOTE_RESPONSE_HOST}
+
+
+@app.post("/api/kill-switch/lift")
+async def kill_switch_lift():
+    """Restore normal iptables policies after an isolation (analyst override)."""
+    if not settings.REMOTE_RESPONSE_HOST:
+        raise HTTPException(status_code=400, detail="No target configured")
+    ok = lift_isolation(
+        host=settings.REMOTE_RESPONSE_HOST,
+        user=settings.REMOTE_RESPONSE_USER,
+        port=settings.REMOTE_RESPONSE_PORT,
+        identity_file=settings.REMOTE_RESPONSE_IDENTITY_FILE or None,
+        use_sudo=settings.REMOTE_RESPONSE_USE_SUDO,
+    )
+    return {"success": ok, "target": settings.REMOTE_RESPONSE_HOST}
+
+
+@app.post("/api/kill-switch/simulate")
+async def kill_switch_simulate():
+    """
+    Inject a fake ransomware log to trigger the full detection pipeline
+    without a real attack — useful for demo/PFE presentations.
+    """
+    import json as _json
+    fake_log = _json.dumps({
+        "EventID": 4688,
+        "NewProcessName": "C:\\Windows\\System32\\vssadmin.exe",
+        "CommandLine": "vssadmin delete shadows /all /quiet",
+        "SubjectUserName": "SYSTEM",
+        "IpAddress": "127.0.0.1",
+    })
+    from core.log_collector import LogParser as _LP
+    ev = _LP().parse("windows", fake_log)
+    if not ev:
+        raise HTTPException(status_code=500, detail="Simulation log parse failed")
+    fired = await _evaluate_and_save_log_event(ev)
+    return {
+        "status": "simulated",
+        "event_type": ev.event_type,
+        "alert_fired": fired,
+        "kill_switch_would_fire": settings.KILL_SWITCH_ENABLED,
+    }
 
 
 @app.get("/")

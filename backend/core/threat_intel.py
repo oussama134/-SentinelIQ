@@ -10,6 +10,7 @@ import json
 import hashlib
 import asyncio
 import aiohttp
+import ipaddress
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Optional
@@ -84,6 +85,8 @@ class IPEnrichment:
 # SIMPLE IN-MEMORY CACHE (replace with Redis in production)
 # ============================================================
 class SimpleCache:
+    MAX_ENTRIES = 2000  # prevent unbounded growth with many attacker IPs
+
     def __init__(self, ttl_seconds: int = 3600):
         self._store: dict = {}
         self._ttl = ttl_seconds
@@ -98,6 +101,10 @@ class SimpleCache:
         return entry["value"]
 
     def set(self, key: str, value: dict):
+        if len(self._store) >= self.MAX_ENTRIES:
+            # FIFO eviction: drop oldest insertion-order entry
+            oldest = next(iter(self._store))
+            del self._store[oldest]
         self._store[key] = {
             "value": value,
             "expires": datetime.utcnow() + timedelta(seconds=self._ttl)
@@ -115,17 +122,9 @@ _cache = SimpleCache(ttl_seconds=3600)   # Cache for 1 hour
 # Don't enrich internal IPs
 # ============================================================
 def is_private_ip(ip: str) -> bool:
-    parts = ip.split(".")
-    if len(parts) != 4:
-        return False
     try:
-        first, second = int(parts[0]), int(parts[1])
-        return (
-            first == 10 or
-            first == 127 or
-            (first == 172 and 16 <= second <= 31) or
-            (first == 192 and second == 168)
-        )
+        addr = ipaddress.ip_address(ip)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified
     except ValueError:
         return False
 
@@ -141,12 +140,18 @@ class ThreatIntelClient:
     def __init__(self):
         self.abuseipdb_key = settings.ABUSEIPDB_API_KEY
 
+    _SKIP_VALUES = {"0.0.0.0", "multiple", "unknown", "localhost", ""}
+
     async def enrich_ip(self, ip: str) -> IPEnrichment:
         """
         Main enrichment function.
         Fetches geolocation (free, no key) + AbuseIPDB (free tier).
         Results cached for 1 hour.
         """
+        # Skip invalid / placeholder values
+        if not ip or ip in self._SKIP_VALUES:
+            return IPEnrichment(ip=ip or "unknown", isp="Invalid/Special Address")
+
         # Skip private IPs
         if is_private_ip(ip):
             return IPEnrichment(ip=ip, isp="Private/Internal Network")

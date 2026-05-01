@@ -45,9 +45,20 @@ async def get_db():
 
 
 async def init_db():
-    """Create all tables on startup"""
+    """Create all tables on startup, and apply lightweight inline migrations."""
+    from sqlalchemy import text
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Inline migrations — safe to run repeatedly (IF NOT EXISTS)
+        _migrations = [
+            "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS device_id VARCHAR(100)",
+            "CREATE INDEX IF NOT EXISTS ix_alerts_device_id ON alerts (device_id)",
+        ]
+        for stmt in _migrations:
+            try:
+                await conn.execute(text(stmt))
+            except Exception as _e:
+                print(f"[DB] Migration skipped ({stmt[:50]}…): {_e}")
 
 
 # ============================================================
@@ -163,6 +174,9 @@ class Alert(Base):
     ip_country = Column(String(5))           # "MA", "CN", "RU"
     ip_isp = Column(String(200))
     is_known_malicious = Column(Boolean, default=False)
+
+    # Origin device (set by ubuntu_forwarder --device-id)
+    device_id = Column(String(100), nullable=True, index=True)
 
     # Relationships
     incident_id = Column(Integer, ForeignKey("incidents.id"), nullable=True)

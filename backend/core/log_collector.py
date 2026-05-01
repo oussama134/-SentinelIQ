@@ -351,6 +351,16 @@ class WindowsEventParser:
         1102: ("audit_cleared",       "Audit log cleared"),
     }
 
+    # Ransomware hallmarks detectable in process creation (Event 4688)
+    _VSS_PATTERN = re.compile(
+        r"(vssadmin\s+delete\s+shadows|vssadmin\.exe.*delete|"
+        r"wmic\s+shadowcopy\s+delete|wmic\.exe.*shadowcopy.*delete|"
+        r"bcdedit\s+/set.*bootstatuspolicy|bcdedit\.exe.*bootstatuspolicy|"
+        r"wbadmin\s+delete\s+catalog|cipher\s+/w:|"
+        r"schtasks.*delete.*backup)",
+        re.IGNORECASE,
+    )
+
     def parse(self, line: str) -> Optional[ParsedLogEvent]:
         try:
             data = json.loads(line)
@@ -359,10 +369,26 @@ class WindowsEventParser:
         eid = data.get("EventID")
         if eid not in self.INTERESTING:
             return None
-        ev_type, desc = self.INTERESTING[eid]
+
         raw_ip = data.get("IpAddress", data.get("SourceAddress", "127.0.0.1"))
         ip = raw_ip if (raw_ip and raw_ip not in ("-", "")) else "127.0.0.1"
         user = data.get("TargetUserName", data.get("SubjectUserName", "unknown"))
+
+        # Special case: ransomware VSS deletion via process creation
+        if eid == 4688:
+            cmd = (str(data.get("CommandLine") or "") + " " +
+                   str(data.get("NewProcessName") or "")).strip()
+            if self._VSS_PATTERN.search(cmd):
+                return ParsedLogEvent(
+                    source_type="windows", event_type="ransomware_vss_deletion",
+                    timestamp=datetime.utcnow(), src_ip=ip, dst_ip="",
+                    username=user,
+                    message=f"Shadow Copy deletion: {cmd[:120]}",
+                    raw=line.strip(),
+                    extra={**data, "cmd_line": cmd},
+                )
+
+        ev_type, desc = self.INTERESTING[eid]
         return ParsedLogEvent(
             source_type="windows", event_type=ev_type,
             timestamp=datetime.utcnow(), src_ip=ip, dst_ip="",
@@ -378,6 +404,16 @@ class SyslogParser:
     )
     _IP = re.compile(r"([\d]{1,3}(?:\.[\d]{1,3}){3})")
 
+    # Linux ransomware indicators: backup wipe, mass encryption, ransom note drop
+    _RANSOM_LINUX = re.compile(
+        r"(lvremove\s+-f|vgremove\s+-f|rm\s+-rf\s+/backup|"
+        r"openssl\s+enc.*-e.*-aes|gpg\s+--symmetric|"
+        r"find\s+/.*-name.*\.(doc|xls|pdf|jpg).*-exec.*rm|"
+        r"DECRYPT.*INSTRUCTIONS|YOUR FILES HAVE BEEN ENCRYPTED|"
+        r"\.encrypted\b|\.locked\b|\.ransomed\b)",
+        re.IGNORECASE,
+    )
+
     def parse(self, line: str) -> Optional[ParsedLogEvent]:
         m = self.PATTERN.match(line)
         if not m:
@@ -385,6 +421,18 @@ class SyslogParser:
         priority, ts, host, app, msg = m.groups()
         ip_m = self._IP.search(msg)
         ip = ip_m.group(1) if ip_m else "0.0.0.0"
+
+        # Ransomware behaviour takes highest priority
+        if self._RANSOM_LINUX.search(msg):
+            return ParsedLogEvent(
+                source_type="syslog", event_type="ransomware_vss_deletion",
+                timestamp=self._ts(ts), src_ip=ip, dst_ip="",
+                username=None,
+                message=f"Ransomware indicator: {msg.strip()[:120]}",
+                raw=line.strip(),
+                extra={"host": host, "app": app, "priority": int(priority)},
+            )
+
         ev = ("syslog_security_event"
               if re.search(r"(fail|error|denied|invalid|attack|breach)", msg, re.I)
               else "syslog_generic")

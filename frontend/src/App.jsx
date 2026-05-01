@@ -1,3 +1,9 @@
+/**
+ * SentinelIQ dashboard shell.
+ *
+ * This component orchestrates the live SOC overview, charts, alert details,
+ * log explorer, and configuration panels shown in the frontend.
+ */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import AlertDetail from './components/AlertDetail';
 import LogExplorer from './components/LogExplorer';
@@ -546,6 +552,69 @@ function Sidebar({ tab, setTab, critCount, live, setLive, clock }) {
 }
 
 // ── MAIN APP ──────────────────────────────────────────────────────────────────
+// ── DefenseRow — toggle row used in the AD panel ─────────────────────────────
+function DefenseRow({ label, sublabel, enabled, dimmed, onChange, accent, isLast }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      gap: 10, opacity: dimmed ? .45 : 1,
+    }}>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ color: '#c9d1d9', fontSize: 11, fontWeight: 600, fontFamily: 'monospace', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {label}
+        </div>
+        {sublabel && (
+          <div style={{ color: '#6e7681', fontSize: 9, marginTop: 1 }}>{sublabel}</div>
+        )}
+      </div>
+      {/* Toggle pill */}
+      <div
+        onClick={() => !dimmed && onChange(!enabled)}
+        style={{
+          width: 36, height: 18, borderRadius: 9, flexShrink: 0,
+          background: enabled ? `${accent}44` : '#1e2940',
+          border: `1px solid ${enabled ? accent : '#30363d'}`,
+          cursor: dimmed ? 'default' : 'pointer',
+          position: 'relative', transition: 'all .2s',
+        }}
+      >
+        <div style={{
+          position: 'absolute', top: 2, left: enabled ? 18 : 2,
+          width: 12, height: 12, borderRadius: '50%',
+          background: enabled ? accent : '#6e7681',
+          boxShadow: enabled ? `0 0 6px ${accent}` : 'none',
+          transition: 'all .2s',
+        }} />
+      </div>
+    </div>
+  );
+}
+
+// ── FlushOption — row in the flush dropdown ───────────────────────────────────
+function FlushOption({ label, sublabel, active, danger, onClick }) {
+  const [hov, setHov] = React.useState(false);
+  const col = danger ? '#f85149' : '#c9d1d9';
+  return (
+    <div
+      onClick={onClick}
+      onMouseEnter={() => setHov(true)}
+      onMouseLeave={() => setHov(false)}
+      style={{
+        padding: '7px 14px', cursor: 'pointer',
+        background: hov ? (danger ? 'rgba(248,81,73,.1)' : '#0d1929') : 'transparent',
+        transition: 'background .1s',
+      }}
+    >
+      <div style={{ color: active ? (danger ? '#f85149' : '#58a6ff') : col, fontSize: 11, fontWeight: active ? 700 : 400, fontFamily: label.startsWith('└') || label.startsWith('├') ? 'monospace' : 'inherit' }}>
+        {label}
+      </div>
+      {sublabel && (
+        <div style={{ color: '#6e7681', fontSize: 9, marginTop: 1 }}>{sublabel}</div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [tab,       setTab]       = useState('alerts');
   const [alerts,    setAlerts]    = useState([]);
@@ -557,11 +626,24 @@ export default function App() {
   // They are separate so typing in the IP box never triggers a server refetch.
   const [inputIp,   setInputIp]   = useState('');
   const [filterIp,  setFilterIp]  = useState('');
-  const [filterType,setFilterType]= useState('');
-  const [filterSev, setFilterSev] = useState('');
+  const [filterType,  setFilterType]  = useState('');
+  const [filterSev,   setFilterSev]   = useState('');
+  const [filterDevice,setFilterDevice]= useState('');
   const [newIds,    setNewIds]    = useState(new Set());
-  const [loading,   setLoading]   = useState(true);
-  const prevIds = useRef(new Set());
+  const [loading,      setLoading]      = useState(true);
+  const [adEnabled,    setAdEnabled]    = useState(true);
+  const [flushing,     setFlushing]     = useState(false);
+  const [flushTarget,  setFlushTarget]  = useState('');       // '' = All
+  const [showFlushDrop,setShowFlushDrop]= useState(false);
+  const [showAdPanel,  setShowAdPanel]  = useState(false);
+  const [deviceStates, setDeviceStates] = useState({ global: true, devices: [] });
+  const [toasts,       setToasts]       = useState([]);
+  const prevIds       = useRef(new Set());
+  const toastIdRef    = useRef(0);
+  const prevBanKeys   = useRef(null);
+  const prevKsLen     = useRef(null);
+  const flushDropRef  = useRef(null);
+  const adPanelRef    = useRef(null);
 
   // Clock tick
   useEffect(() => {
@@ -569,11 +651,72 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  const addToast = useCallback((type, title, sub) => {
+    const id = ++toastIdRef.current;
+    setToasts(prev => [...prev, { id, type, title, sub }]);
+    setTimeout(() => setToasts(prev => prev.filter(t => t.id !== id)), 8000);
+  }, []);
+
+  const dismissToast = useCallback((id) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
+
   // Debounce IP input → only apply the filter 400 ms after the user stops typing
   useEffect(() => {
     const t = setTimeout(() => setFilterIp(inputIp), 400);
     return () => clearTimeout(t);
   }, [inputIp]);
+
+
+  // ── Device states (active defense per-machine) ───────────────────────────
+  const fetchDeviceStates = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/active-defense/device-states`);
+      const d = await r.json();
+      setDeviceStates(d);
+      setAdEnabled(d.global);
+    } catch {}
+  }, []);
+
+  useEffect(() => { fetchDeviceStates(); }, [fetchDeviceStates]);
+
+  // Close dropdowns on outside click
+  useEffect(() => {
+    const handler = e => {
+      if (flushDropRef.current && !flushDropRef.current.contains(e.target))
+        setShowFlushDrop(false);
+      if (adPanelRef.current && !adPanelRef.current.contains(e.target))
+        setShowAdPanel(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
+
+  const flushBlocks = async (target) => {
+    const label = !target ? 'ALL machines' : target === '__windows__' ? 'Windows SIEM' : target;
+    if (!window.confirm(`Remove bans for ${label}?`)) return;
+    setFlushing(true);
+    setShowFlushDrop(false);
+    try {
+      const endpoint = !target
+        ? `${API}/api/active-defense/flush-all`
+        : `${API}/api/active-defense/flush-device?device_id=${encodeURIComponent(target)}`;
+      await fetch(endpoint, { method: 'POST' });
+      await fetchData();
+    } catch {}
+    setFlushing(false);
+  };
+
+  const toggleDeviceDefense = async (deviceId, enabled) => {
+    try {
+      await fetch(
+        `${API}/api/active-defense/toggle-device?device_id=${encodeURIComponent(deviceId)}&enabled=${enabled}`,
+        { method: 'POST' }
+      );
+      if (deviceId === '__global__') setAdEnabled(enabled);
+      await fetchDeviceStates();
+    } catch {}
+  };
 
   // fetchData never depends on filter state — always fetches all 150 alerts.
   // Filtering is done client-side, so the IP box never triggers a server round-trip.
@@ -583,6 +726,9 @@ export default function App() {
         fetch(`${API}/api/siem/alerts?limit=150`).then(r => r.json()),
         fetch(`${API}/api/siem/dashboard`).then(r => r.json()),
       ]);
+
+      // Keep defense toggle in sync — catches backend restarts resetting state to ON
+      fetchDeviceStates();
 
       if (ar.status === 'fulfilled' && Array.isArray(ar.value?.alerts)) {
         const list = ar.value.alerts;
@@ -604,8 +750,36 @@ export default function App() {
         setDashboard(dr.value);
       }
     } catch {}
+
+    // ── IP ban notifications ────────────────────────────────────────
+    try {
+      const bd = await fetch(`${API}/api/active-defense/bans`).then(r => r.json());
+      const ipBans = (bd.bans || []).filter(b => b.ban_type === 'IP');
+      // key = identifier + banned_at so a re-ban of the same IP after expiry fires again
+      const keys = new Set(ipBans.map(b => `${b.identifier}|${b.banned_at}`));
+      if (prevBanKeys.current !== null) {
+        ipBans
+          .filter(b => !prevBanKeys.current.has(`${b.identifier}|${b.banned_at}`))
+          .forEach(b => addToast('block', 'IP Blocked', `${b.identifier} · ${b.attack_type}`));
+      }
+      prevBanKeys.current = keys;
+    } catch {}
+
+    // ── Kill switch notifications ───────────────────────────────────
+    try {
+      const ks = await fetch(`${API}/api/kill-switch/status`).then(r => r.json());
+      const log = ks.audit_log || [];
+      if (prevKsLen.current !== null && log.length > prevKsLen.current) {
+        log.slice(prevKsLen.current).forEach(e => {
+          const label = e.action === 'shutdown' ? 'Machine Shutdown' : 'Machine Isolated';
+          addToast('isolate', label, `${e.host || ks.target || ''}${e.reason ? ' · ' + e.reason.slice(0, 60) : ''}`);
+        });
+      }
+      prevKsLen.current = log.length;
+    } catch {}
+
     setLoading(false);
-  }, []);   // ← no filter deps: typing never causes a refetch
+  }, [addToast, fetchDeviceStates]);
 
   useEffect(() => {
     setLoading(true);
@@ -621,13 +795,17 @@ export default function App() {
 
   const visible = alerts.filter(a => {
     const k = normSev(a.severity);
-    if (filterSev && k !== filterSev) return false;
-    if (filterIp   && !(a.src_ip   || '').includes(filterIp))   return false;
-    if (filterType && !(a.attack_type || '').toLowerCase().includes(filterType.toLowerCase())) return false;
+    if (filterSev    && k !== filterSev) return false;
+    if (filterIp     && !(a.src_ip     || '').includes(filterIp))   return false;
+    if (filterType   && !(a.attack_type || '').toLowerCase().includes(filterType.toLowerCase())) return false;
+    if (filterDevice && (a.device_id || '') !== filterDevice) return false;
     return true;
   });
 
   const attackTypes = [...new Set(alerts.map(a => a.attack_type).filter(Boolean))];
+
+  // Sorted list of device_ids that appear in the current alert set
+  const devices = [...new Set(alerts.map(a => a.device_id).filter(Boolean))].sort();
 
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', flexDirection: 'column', gap: 14, background: '#060b14' }}>
@@ -648,8 +826,67 @@ export default function App() {
         @keyframes spin    { to { transform: rotate(360deg); } }
         @keyframes pulse   { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.3)} }
         @keyframes flashIn { 0%{background:rgba(248,81,73,.25)} 100%{background:transparent} }
-        @keyframes slideIn { from{opacity:0;transform:translateX(16px)} to{opacity:1;transform:translateX(0)} }
+        @keyframes slideIn      { from{opacity:0;transform:translateX(16px)} to{opacity:1;transform:translateX(0)} }
+        @keyframes slideInRight { from{opacity:0;transform:translateX(32px)} to{opacity:1;transform:translateX(0)} }
+        @keyframes toastOut     { from{opacity:1;transform:translateX(0)} to{opacity:0;transform:translateX(32px)} }
       `}</style>
+
+      {/* ── Toast notification stack ── */}
+      <div style={{
+        position: 'fixed', top: 56, right: 14,
+        display: 'flex', flexDirection: 'column', gap: 8,
+        zIndex: 9999, pointerEvents: 'none',
+        maxWidth: 340,
+      }}>
+        {toasts.map(t => {
+          const isIsolate = t.type === 'isolate';
+          const accent = isIsolate ? '#f85149' : '#f0883e';
+          return (
+            <div key={t.id} style={{
+              pointerEvents: 'all',
+              display: 'flex', alignItems: 'flex-start', gap: 10,
+              padding: '10px 12px',
+              background: isIsolate ? 'rgba(248,81,73,.12)' : 'rgba(240,136,62,.12)',
+              border: `1px solid ${accent}44`,
+              borderLeft: `3px solid ${accent}`,
+              borderRadius: 8,
+              boxShadow: `0 4px 24px rgba(0,0,0,.5), 0 0 0 1px ${accent}11`,
+              backdropFilter: 'blur(10px)',
+              animation: 'slideInRight .25s ease',
+            }}>
+              {/* icon */}
+              <span style={{ fontSize: 18, lineHeight: 1.2, flexShrink: 0 }}>
+                {isIsolate ? '🔒' : '🛡️'}
+              </span>
+
+              {/* text */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: accent, letterSpacing: '.06em', textTransform: 'uppercase' }}>
+                  {t.title}
+                </div>
+                {t.sub && (
+                  <div style={{ fontSize: 11, color: '#8b949e', marginTop: 3, fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                    {t.sub}
+                  </div>
+                )}
+              </div>
+
+              {/* dismiss */}
+              <button
+                onClick={() => dismissToast(t.id)}
+                style={{
+                  background: 'none', border: 'none', color: '#4a5568',
+                  cursor: 'pointer', fontSize: 15, lineHeight: 1,
+                  padding: '0 2px', flexShrink: 0,
+                  transition: 'color .1s',
+                }}
+                onMouseEnter={e => e.currentTarget.style.color = '#8b949e'}
+                onMouseLeave={e => e.currentTarget.style.color = '#4a5568'}
+              >×</button>
+            </div>
+          );
+        })}
+      </div>
 
       <Sidebar tab={tab} setTab={setTab} critCount={critCount} live={live} setLive={setLive} clock={clock} />
 
@@ -696,8 +933,20 @@ export default function App() {
                 <option value="">All Severity</option>
                 {['CRITICAL','HIGH','MEDIUM','LOW'].map(s => <option key={s} value={s}>{s}</option>)}
               </select>
-              {(inputIp || filterType || filterSev) && (
-                <button onClick={() => { setInputIp(''); setFilterIp(''); setFilterType(''); setFilterSev(''); }}
+              <select
+                value={filterDevice}
+                onChange={e => setFilterDevice(e.target.value)}
+                style={{ background: '#0d1929', border: '1px solid #1e2940', color: '#c9d1d9', borderRadius: 5, padding: '3px 8px', fontSize: 11, outline: 'none', maxWidth: 180 }}
+              >
+                <option value="">All Devices</option>
+                {devices.map((d, i) => (
+                  <option key={d} value={d}>
+                    {i === devices.length - 1 ? '└── ' : '├── '}{d}
+                  </option>
+                ))}
+              </select>
+              {(inputIp || filterType || filterSev || filterDevice) && (
+                <button onClick={() => { setInputIp(''); setFilterIp(''); setFilterType(''); setFilterSev(''); setFilterDevice(''); }}
                   style={{ background: 'none', border: 'none', color: '#6e7681', cursor: 'pointer', fontSize: 14 }}>
                   ×
                 </button>
@@ -705,6 +954,182 @@ export default function App() {
               <span style={{ color: '#6e7681', fontSize: 11 }}>{visible.length} / {alerts.length}</span>
             </div>
           )}
+
+          {/* ── Active Defense expandable panel ── */}
+          <div ref={adPanelRef} style={{ position: 'relative' }}>
+            <button
+              onClick={() => setShowAdPanel(v => !v)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                background: adEnabled ? 'rgba(63,185,80,.12)' : 'rgba(110,118,129,.1)',
+                border: `1px solid ${adEnabled ? '#3fb95055' : '#3d4d5f'}`,
+                color: adEnabled ? '#3fb950' : '#6e7681',
+                borderRadius: 5, padding: '3px 10px', fontSize: 11,
+                cursor: 'pointer', fontWeight: 700, transition: 'all .2s',
+              }}
+            >
+              <span style={{
+                width: 7, height: 7, borderRadius: '50%',
+                background: adEnabled ? '#3fb950' : '#6e7681',
+                boxShadow: adEnabled ? '0 0 6px #3fb950' : 'none',
+                animation: adEnabled ? 'pulse 2s infinite' : 'none',
+                flexShrink: 0,
+              }} />
+              {adEnabled ? 'Defense ON' : 'Defense OFF'}
+              <span style={{ fontSize: 9, opacity: .7, marginLeft: 2 }}>▾</span>
+            </button>
+
+            {showAdPanel && (
+              <div style={{
+                position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 200,
+                background: '#0d1117', border: '1px solid #1e2940',
+                borderRadius: 8, width: 270,
+                boxShadow: '0 8px 32px #00000099',
+                animation: 'slideIn .15s ease',
+              }}>
+                {/* Header */}
+                <div style={{ padding: '10px 14px 8px', borderBottom: '1px solid #1e2940' }}>
+                  <div style={{ color: '#8b949e', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.07em' }}>
+                    Active Defense
+                  </div>
+                </div>
+
+                {/* Global toggle row */}
+                <div style={{ padding: '8px 14px', borderBottom: '1px solid #1e2940' }}>
+                  <DefenseRow
+                    label="Global (all machines)"
+                    sublabel="Master switch"
+                    enabled={deviceStates.global}
+                    onChange={v => toggleDeviceDefense('__global__', v)}
+                    accent="#3fb950"
+                  />
+                </div>
+
+                {/* Per-device rows */}
+                {deviceStates.devices.length > 0 && (
+                  <div style={{ padding: '6px 0', borderBottom: '1px solid #1e2940' }}>
+                    <div style={{ padding: '2px 14px 6px', color: '#6e7681', fontSize: 9, textTransform: 'uppercase', letterSpacing: '.06em' }}>
+                      Per Machine
+                    </div>
+                    {deviceStates.devices.map((d, i) => (
+                      <div key={d.device_id} style={{ padding: '4px 14px' }}>
+                        <DefenseRow
+                          label={d.device_id}
+                          sublabel={d.inherits_global ? 'inherits global' : d.enabled ? 'override: ON' : 'override: OFF'}
+                          enabled={d.inherits_global ? deviceStates.global : d.enabled}
+                          dimmed={!deviceStates.global}
+                          onChange={v => toggleDeviceDefense(d.device_id, v)}
+                          accent="#58a6ff"
+                          isLast={i === deviceStates.devices.length - 1}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Stats footer */}
+                <div style={{ padding: '8px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ color: '#6e7681', fontSize: 10 }}>
+                    {deviceStates.devices.filter(d =>
+                      d.inherits_global ? deviceStates.global : d.enabled
+                    ).length} / {Math.max(deviceStates.devices.length, 1)} machines active
+                  </span>
+                  <button
+                    onClick={() => { setShowAdPanel(false); fetchDeviceStates(); }}
+                    style={{ background: 'none', border: 'none', color: '#58a6ff', fontSize: 10, cursor: 'pointer' }}
+                  >
+                    Refresh ↺
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ── Flush Blocks split-button ── */}
+          <div ref={flushDropRef} style={{ position: 'relative' }}>
+            <div style={{ display: 'flex', borderRadius: 5, overflow: 'hidden', border: '1px solid #f8514944' }}>
+              {/* Main action button */}
+              <button
+                onClick={() => flushBlocks(flushTarget)}
+                disabled={flushing}
+                style={{
+                  background: flushing ? 'rgba(248,81,73,.05)' : 'rgba(248,81,73,.1)',
+                  border: 'none', borderRight: '1px solid #f8514933',
+                  color: flushing ? '#6e7681' : '#f85149',
+                  padding: '3px 10px', fontSize: 11,
+                  cursor: flushing ? 'default' : 'pointer', fontWeight: 600,
+                  transition: 'all .2s', whiteSpace: 'nowrap',
+                }}
+              >
+                {flushing ? 'Flushing…' : `Flush ${!flushTarget ? 'All' : flushTarget === '__windows__' ? 'Windows' : flushTarget}`}
+              </button>
+              {/* Dropdown arrow */}
+              <button
+                onClick={() => setShowFlushDrop(v => !v)}
+                disabled={flushing}
+                style={{
+                  background: flushing ? 'rgba(248,81,73,.05)' : 'rgba(248,81,73,.08)',
+                  border: 'none',
+                  color: flushing ? '#6e7681' : '#f85149',
+                  padding: '3px 7px', fontSize: 10,
+                  cursor: flushing ? 'default' : 'pointer',
+                }}
+              >▾</button>
+            </div>
+
+            {showFlushDrop && !flushing && (
+              <div style={{
+                position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 200,
+                background: '#0d1117', border: '1px solid #1e2940',
+                borderRadius: 8, minWidth: 220,
+                boxShadow: '0 8px 32px #00000099',
+                animation: 'slideIn .15s ease', overflow: 'hidden',
+              }}>
+                {/* Section label */}
+                <div style={{ padding: '8px 14px 4px', color: '#6e7681', fontSize: 9, textTransform: 'uppercase', letterSpacing: '.07em' }}>
+                  Select target
+                </div>
+
+                {/* All machines */}
+                <FlushOption
+                  label="⚠ All Machines"
+                  sublabel="Flush every ban — Windows + all Ubuntu"
+                  active={flushTarget === ''}
+                  danger
+                  onClick={() => { setFlushTarget(''); setShowFlushDrop(false); }}
+                />
+
+                <div style={{ height: 1, background: '#1e2940', margin: '2px 0' }} />
+
+                {/* Per-device options */}
+                {devices.map((d, i) => (
+                  <FlushOption
+                    key={d}
+                    label={`${i === devices.length - 1 ? '└' : '├'}── ${d}`}
+                    sublabel="Remote iptables flush (SSH)"
+                    active={flushTarget === d}
+                    onClick={() => { setFlushTarget(d); setShowFlushDrop(false); }}
+                  />
+                ))}
+
+                {devices.length === 0 && (
+                  <div style={{ padding: '6px 14px 8px', color: '#6e7681', fontSize: 10 }}>
+                    No remote devices detected yet
+                  </div>
+                )}
+
+                <div style={{ height: 1, background: '#1e2940', margin: '2px 0' }} />
+
+                {/* Windows local */}
+                <FlushOption
+                  label="🖥 Windows SIEM (local)"
+                  sublabel="Windows Firewall rules only"
+                  active={flushTarget === '__windows__'}
+                  onClick={() => { setFlushTarget('__windows__'); setShowFlushDrop(false); }}
+                />
+              </div>
+            )}
+          </div>
 
           <button onClick={fetchData} style={{
             background: 'rgba(88,166,255,.08)', border: '1px solid #1e2940',

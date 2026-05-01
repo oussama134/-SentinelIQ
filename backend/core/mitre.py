@@ -195,6 +195,26 @@ MITRE_MAPPINGS: dict[str, MitreMapping] = {
         severity_base="HIGH"
     ),
 
+    "Ransomware": MitreMapping(
+        attack_label="Ransomware",
+        tactic="Impact",
+        tactic_id="TA0040",
+        technique_id="T1486",
+        technique_name="Data Encrypted for Impact",
+        kill_chain_stage="Actions on Objectives",
+        severity_base="CRITICAL"
+    ),
+
+    "Shadow Copy Deletion": MitreMapping(
+        attack_label="Shadow Copy Deletion",
+        tactic="Impact",
+        tactic_id="TA0040",
+        technique_id="T1490",
+        technique_name="Inhibit System Recovery",
+        kill_chain_stage="Actions on Objectives",
+        severity_base="CRITICAL"
+    ),
+
     "DDoS": MitreMapping(
         attack_label="DDoS",
         tactic="Impact",
@@ -238,9 +258,11 @@ EVENT_TYPE_MAPPINGS: dict[str, str] = {
     "botnet_activity":      "Bot",
     "heartbleed_exploit":   "Heartbleed",
     # New log-path event types
-    "nginx_path_traversal": "Path Traversal",
-    "sudo_privilege_esc":   "Privilege Escalation",
-    "syslog_security_event":"PortScan",                     # generic — no dedicated class for syslog events
+    "nginx_path_traversal":      "Path Traversal",
+    "sudo_privilege_esc":        "Privilege Escalation",
+    "syslog_security_event":     "PortScan",
+    "ransomware_vss_deletion":   "Shadow Copy Deletion",
+    "ransomware_mass_encryption":"Ransomware",
 }
 
 

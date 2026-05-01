@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     REMOTE_RESPONSE_BACKEND: str = "iptables"   # iptables | ufw
     REMOTE_RESPONSE_USE_SUDO: bool = True
 
+    # Kill Switch — radical remediation on confirmed ransomware
+    KILL_SWITCH_ENABLED: bool = False          # set True in .env to arm it
+    KILL_SWITCH_ACTION: str = "isolate"        # "isolate" (network drop) | "shutdown"
+    # Reuses REMOTE_RESPONSE_* for SSH creds — no extra config needed
+
     # AI Agent
     OLLAMA_HOST: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3"

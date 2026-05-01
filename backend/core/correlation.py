@@ -330,7 +330,42 @@ DEFAULT_RULES: list[Rule] = [
         description="Single syslog security event — UFW block, auth denial, or service failure",
         mitre_technique_id="T1562",
     ),
+
+    # ── KILL SWITCH trigger rules ────────────────────────────────────────────────
+    # These two rules arm the kill switch. Any alert they generate with
+    # severity=CRITICAL will be intercepted in main.py and the kill switch
+    # will execute the configured action against the remote victim.
+
+    Rule(
+        rule_id="R030",
+        name="Ransomware — Shadow Copy / Backup Deletion",
+        event_type="ransomware_vss_deletion",
+        count_threshold=1,
+        window_seconds=1,
+        severity="CRITICAL",
+        description=(
+            "Volume Shadow Copy or backup deletion detected — hallmark pre-encryption step. "
+            "KILL SWITCH ARMED (T1490)"
+        ),
+        mitre_technique_id="T1490",
+    ),
+    Rule(
+        rule_id="R031",
+        name="Ransomware — Mass File Encryption",
+        event_type="ransomware_mass_encryption",
+        count_threshold=1,
+        window_seconds=1,
+        severity="CRITICAL",
+        description=(
+            "Mass file encryption activity detected. "
+            "KILL SWITCH ARMED (T1486)"
+        ),
+        mitre_technique_id="T1486",
+    ),
 ]
+
+# Rules that arm the kill switch — checked by main.py
+KILL_SWITCH_RULE_IDS = {"R030", "R031"}
 
 
 # ============================================================
@@ -413,6 +448,7 @@ class CorrelationEngine:
         self._event_counts: dict[str, dict[str, list[float]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        self._call_count: int = 0
 
     def process_log(self, log) -> list[TriggeredAlert]:
         """
@@ -420,6 +456,11 @@ class CorrelationEngine:
         UnifiedLog from ingestion.py
         """
         alerts = []
+
+        # Periodic cleanup: remove stale IPs from sliding-window counters
+        self._call_count += 1
+        if self._call_count % 1000 == 0:
+            self._purge_expired()
 
         # Step 1: Check ML confidence threshold
         if log.predicted_label and log.confidence:
@@ -488,6 +529,21 @@ class CorrelationEngine:
         if rule.event_type == "dos_hulk" and event_type.startswith("dos_"):
             return True
         return False
+
+    def _purge_expired(self):
+        """Remove IPs whose entire timestamp list has aged out of every rule window."""
+        if not self.rules:
+            return
+        max_window = max(r.window_seconds for r in self.rules.values())
+        cutoff = time.time() - max_window
+        for event_type in list(self._event_counts.keys()):
+            ip_dict = self._event_counts[event_type]
+            for src_ip in list(ip_dict.keys()):
+                ip_dict[src_ip] = [t for t in ip_dict[src_ip] if t >= cutoff]
+                if not ip_dict[src_ip]:
+                    del ip_dict[src_ip]
+            if not ip_dict:
+                del self._event_counts[event_type]
 
     def get_stats(self) -> dict:
         """Return current engine statistics"""

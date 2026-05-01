@@ -1,4 +1,9 @@
-# traffic_filter.py - Smart filtering to reduce false positives
+"""
+Traffic filtering and active defense helpers for SentinelIQ.
+
+This module suppresses routine network noise, post-processes model output,
+and exposes helper logic that keeps alerts focused on actionable threats.
+"""
 
 # ============================================================================
 # WHITELIST CONFIGURATION
@@ -47,6 +52,13 @@ WHITELIST_IP_PREFIXES = [
 ]
 
 DYNAMIC_WHITELIST = set()
+
+# IPs that are benign only when they are the SOURCE (server's own outbound traffic in cloud/VM setups).
+# When the same prefix appears as the DESTINATION it is NOT skipped — inbound attacks are still detected.
+SRC_ONLY_SKIP_PREFIXES = [
+    "10.0.",       # OCI / generic cloud private VNICs — server's own egress connections
+    "169.254.",    # Link-local: OCI instance metadata service, APIPA
+]
 
 def _ip_matches_entry(ip: str, entry: str) -> bool:
     """Exact-match host IPs; only treat entries as prefixes when explicit."""
@@ -170,9 +182,16 @@ def is_benign_system_traffic(flow_info: dict) -> bool:
     for pfx in WHITELIST_IP_PREFIXES:
         if _ip_matches_entry(src_ip, pfx) or _ip_matches_entry(dst_ip, pfx):
             return True
-            
+
     for pfx in DYNAMIC_WHITELIST:
         if _ip_matches_entry(src_ip, pfx) or _ip_matches_entry(dst_ip, pfx):
+            return True
+
+    # ── 1b. Source-only skip: cloud/VM server outbound traffic
+    # Skip when the SERVER's own private IP is the source (normal egress).
+    # Do NOT skip when it's the destination — inbound attacks must still fire.
+    for pfx in SRC_ONLY_SKIP_PREFIXES:
+        if _ip_matches_entry(src_ip, pfx):
             return True
 
     # ── 1.5. CHECK ACTIVE BANS (DROP IMMEDIATELY IF BANNED)
