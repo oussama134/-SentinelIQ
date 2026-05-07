@@ -40,7 +40,7 @@ class Predictor:
         ).to(self.device)
         
         model_path = os.path.join(models_dir, "lstm_cicids.pth")
-        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=False))
         self.model.eval()
         
         print(f"[OK] Model loaded: {num_classes} classes, {input_dim} features")

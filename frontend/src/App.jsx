@@ -95,6 +95,34 @@ function StatsBar({ dashboard, alertCount }) {
   );
 }
 
+function displayDevice(id) {
+  return id || '—';
+}
+
+// ── Country code → full name (covers existing 2-letter DB records) ────────────
+const COUNTRY_NAMES = {
+  AF:'Afghanistan',AL:'Albania',DZ:'Algeria',AR:'Argentina',AU:'Australia',
+  AT:'Austria',AZ:'Azerbaijan',BD:'Bangladesh',BE:'Belgium',BR:'Brazil',
+  BG:'Bulgaria',CA:'Canada',CL:'Chile',CN:'China',CO:'Colombia',HR:'Croatia',
+  CZ:'Czechia',DK:'Denmark',EG:'Egypt',EE:'Estonia',FI:'Finland',FR:'France',
+  DE:'Germany',GH:'Ghana',GR:'Greece',HK:'Hong Kong',HU:'Hungary',IN:'India',
+  ID:'Indonesia',IR:'Iran',IQ:'Iraq',IE:'Ireland',IL:'Israel',IT:'Italy',
+  JP:'Japan',JO:'Jordan',KZ:'Kazakhstan',KE:'Kenya',KR:'South Korea',
+  KW:'Kuwait',LV:'Latvia',LB:'Lebanon',LT:'Lithuania',LU:'Luxembourg',
+  MY:'Malaysia',MX:'Mexico',MA:'Morocco',NL:'Netherlands',NZ:'New Zealand',
+  NG:'Nigeria',NO:'Norway',PK:'Pakistan',PE:'Peru',PH:'Philippines',PL:'Poland',
+  PT:'Portugal',QA:'Qatar',RO:'Romania',RU:'Russia',SA:'Saudi Arabia',
+  SG:'Singapore',SK:'Slovakia',ZA:'South Africa',ES:'Spain',SE:'Sweden',
+  CH:'Switzerland',TW:'Taiwan',TH:'Thailand',TN:'Tunisia',TR:'Turkey',
+  UA:'Ukraine',AE:'United Arab Emirates',GB:'United Kingdom',
+  US:'United States',VN:'Vietnam',
+};
+function displayCountry(v) {
+  if (!v) return '—';
+  if (v.length > 2) return v; // already full name stored in DB
+  return COUNTRY_NAMES[v.toUpperCase()] || v;
+}
+
 // ── AlertRow ─────────────────────────────────────────────────────────────────
 function AlertRow({ alert: a, selected, onClick, isNew }) {
   const k = normSev(a.severity);
@@ -129,12 +157,20 @@ function AlertRow({ alert: a, selected, onClick, isNew }) {
         {a.dst_ip && a.dst_ip !== '0.0.0.0' && a.dst_ip !== '' && (
           <>
             <span style={{ color: '#3d4d5f', fontSize: 10, flexShrink: 0 }}>→</span>
-            <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#7d8fa8', flexShrink: 0 }}>{a.dst_ip}</span>
+            <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#79c0ff', flexShrink: 0 }}>{a.dst_ip}</span>
           </>
         )}
         <span style={{ color: '#3d4d5f', flexShrink: 0 }}>·</span>
         <span style={{ fontSize: 11, color: '#6e7681', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.attack_type}</span>
-        <span style={{ marginLeft: 'auto', flexShrink: 0 }}><ConfDot v={a.confidence} /></span>
+        <span style={{
+          marginLeft: 'auto', flexShrink: 0,
+          background: 'rgba(120,92,255,.15)', color: '#a78bfa',
+          border: '1px solid rgba(120,92,255,.35)',
+          borderRadius: 3, padding: '0 5px', fontSize: 9, fontWeight: 700,
+          fontFamily: 'monospace', letterSpacing: '.04em', maxWidth: 100,
+          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+        }} title={displayDevice(a.device_id)}>{displayDevice(a.device_id)}</span>
+        <span style={{ flexShrink: 0 }}><ConfDot v={a.confidence} /></span>
       </div>
     </div>
   );

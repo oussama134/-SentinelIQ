@@ -92,81 +92,6 @@ def update_trusted_ips_cache(ips):
 
 # ============================================================================
 # ACTIVE DEFENSE: DYNAMIC BAN LIST (IPs & USER-AGENTS)
-# ============================================================================
-import time
-import subprocess
-import threading
-
-class ActiveDefenseCache:
-    def __init__(self):
-        self.banned_ips = {}           # { ip: expiration_time }
-        self.banned_user_agents = {}   # { ua: expiration_time }
-        self.banned_sessions = {}      # { session_id: expiration_time }
-        self.block_duration = 3600     # 1 hour default block
-
-    def _block_ip_windows_firewall(self, ip: str):
-        def _run_rule():
-            try:
-                rule_name = f"SentinelIQ_Block_{ip.replace('.', '_')}"
-                # Delete any existing rule with same name first
-                del_cmd = f'netsh advfirewall firewall delete rule name="{rule_name}"'
-                subprocess.run(del_cmd, shell=True, capture_output=True)
-                
-                # Create the new block rule for both inbound and outbound
-                add_cmd = f'netsh advfirewall firewall add rule name="{rule_name}" dir=in action=block remoteip={ip}'
-                subprocess.run(add_cmd, shell=True, capture_output=True)
-                print(f"[🛡️ FIREWALL] Successfully created physical Windows Firewall block rule for {ip}")
-            except Exception as e:
-                print(f"[!] Firewall block failed for {ip} (Needs Admin Privileges). Error: {e}")
-                
-        threading.Thread(target=_run_rule, daemon=True).start()
-
-    def ban_ip(self, ip: str, duration: int = None):
-        if not ip or ip in DYNAMIC_WHITELIST: return
-        self.banned_ips[ip] = time.time() + (duration or self.block_duration)
-        print(f"[🛡️ ActiveDefense] BANNED IP: {ip} for {(duration or self.block_duration)//60} minutes")
-        self._block_ip_windows_firewall(ip)
-
-    def ban_user_agent(self, ua: str, duration: int = None):
-        if not ua or len(ua) < 5: return
-        self.banned_user_agents[ua] = time.time() + (duration or self.block_duration)
-        print(f"[🛡️ ActiveDefense] BANNED USER-AGENT: {ua} for {(duration or self.block_duration)//60} minutes")
-
-    def ban_session(self, session_id: str, duration: int = None):
-        if not session_id: return
-        self.banned_sessions[session_id] = time.time() + (duration or self.block_duration)
-        print(f"[🛡️ ActiveDefense] BANNED SESSION: {session_id} for {(duration or self.block_duration)//60} minutes")
-
-    def is_banned(self, ip: str, ua: str = "", session_id: str = "") -> bool:
-        now = time.time()
-        # Clean expired TTLs lazily and check
-        if ip in self.banned_ips:
-            if now > self.banned_ips[ip]:
-                del self.banned_ips[ip]
-            else:
-                return True
-                
-        if ua and ua in self.banned_user_agents:
-            if now > self.banned_user_agents[ua]:
-                del self.banned_user_agents[ua]
-            else:
-                return True
-                
-        if session_id and session_id in self.banned_sessions:
-            if now > self.banned_sessions[session_id]:
-                del self.banned_sessions[session_id]
-            else:
-                return True
-                
-        return False
-
-# Global instance for active defense
-active_defense = ActiveDefenseCache()
-
-# ============================================================================
-# SINGLE is_benign_system_traffic — merged whitelist + port rules
-# ============================================================================
-
 def is_benign_system_traffic(flow_info: dict) -> bool:
     """
     Returns True if the flow should be SKIPPED (not analyzed).
@@ -194,14 +119,6 @@ def is_benign_system_traffic(flow_info: dict) -> bool:
         if _ip_matches_entry(src_ip, pfx):
             return True
 
-    # ── 1.5. CHECK ACTIVE BANS (DROP IMMEDIATELY IF BANNED)
-    # Using 'is_benign_system_traffic' conceptually means "Skip Analysis".
-    # If it's banned, we SKIP analysis to drop it (we already alerted on it previously).
-    ua = flow_info.get('extra', {}).get('user_agent', '') if 'extra' in flow_info else flow_info.get('user_agent', '')
-    session = flow_info.get('extra', {}).get('session_id', '') if 'extra' in flow_info else flow_info.get('session_id', '')
-    if active_defense.is_banned(ip=src_ip, ua=ua, session_id=session):
-        return True # Drop it (Treat it as 'processed' so it makes no noise)
-
     # ── 2. DNS traffic ───────────────────────────────────────
     if src_port == 53 or dst_port == 53:
         return True
@@ -220,7 +137,8 @@ def is_benign_system_traffic(flow_info: dict) -> bool:
             return True
 
     # ── 6. Broadcast ─────────────────────────────────────────
-    if dst_ip in BROADCAST_IPS:
+    # Covers 255.255.255.255, any subnet broadcast (*.255), and explicit list
+    if dst_ip in BROADCAST_IPS or dst_ip.endswith('.255'):
         return True
 
     # ── 7. Known benign IPs (routers) ────────────────────────
@@ -300,14 +218,6 @@ def post_process_prediction(label, score, flow_info):
 
     return label, score
 
-
-# ============================================================================
-# ALERT DECISION
-# ============================================================================
-
-# ============================================================================
-# ALERT DECISION
-# ============================================================================
 
 def should_generate_alert(label, score, flow_info, min_score=0.85):
     """Returns True if an alert should be generated for this prediction."""

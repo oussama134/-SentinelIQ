@@ -55,7 +55,7 @@ def _ssh(host: str, user: str, port: int,
         "ssh",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
-        "-o", "ConnectTimeout=10",
+        "-o", "ConnectTimeout=5",
         "-p", str(port),
     ]
     if identity_file:

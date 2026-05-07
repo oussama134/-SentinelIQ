@@ -5,6 +5,7 @@ Rules fire alerts. Multiple alerts become incidents.
 """
 import json
 import time
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -19,11 +20,11 @@ from core.mitre import get_mitre_mapping
 # ============================================================
 CLASS_THRESHOLDS: dict[str, float] = {
     "BENIGN":                       0.50,
-    "DoS slowloris":                0.72,
-    "DoS Slowhttptest":             0.72,
+    "DoS slowloris":                0.82,
+    "DoS Slowhttptest":             0.82,
     "DoS Hulk":                     0.70,
     "DoS GoldenEye":                0.70,
-    "DDoS":                         0.55,
+    "DDoS":                         0.85,
 
     "FTP-Patator":                  0.72,
     "SSH-Patator":                  0.72,
@@ -57,7 +58,7 @@ class Rule:
 # Rules that mirror exactly what your attack simulator generates
 DEFAULT_RULES: list[Rule] = [
     Rule(
-        rule_id="R001",
+        rule_id="R001", 
         name="SSH Brute Force Detected",
         event_type="ssh_brute_force",
         count_threshold=1,
@@ -443,6 +444,7 @@ class CorrelationEngine:
     def __init__(self, rules: list[Rule] = None):
         self.rules = {r.rule_id: r for r in (rules or DEFAULT_RULES)}
         self.suppressor = AlertSuppressor(cooldown_seconds=60)
+        self._lock = threading.Lock()
 
         # event_type → src_ip → [timestamps]
         self._event_counts: dict[str, dict[str, list[float]]] = defaultdict(
@@ -453,8 +455,12 @@ class CorrelationEngine:
     def process_log(self, log) -> list[TriggeredAlert]:
         """
         Main entry point. Pass a UnifiedLog, get back list of alerts.
-        UnifiedLog from ingestion.py
+        Thread-safe — called from both the uvicorn event loop and background threads.
         """
+        with self._lock:
+            return self._process_log_unsafe(log)
+
+    def _process_log_unsafe(self, log) -> list[TriggeredAlert]:
         alerts = []
 
         # Periodic cleanup: remove stale IPs from sliding-window counters

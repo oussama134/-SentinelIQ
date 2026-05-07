@@ -8,6 +8,7 @@ behind one API used by the dashboard and remote collection agents.
 
 import os
 import sys
+import socket
 import subprocess
 import time
 import json
@@ -18,12 +19,13 @@ import pandas as pd
 from datetime import datetime, timedelta
 from threading import Thread, Lock
 from collections import Counter, defaultdict
-
+from core.auth  import verify_token, authenticate_user, create_access_token
+from fastapi.security import OAuth2PasswordRequestForm
 import warnings
 from sklearn.exceptions import InconsistentVersionWarning
 warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel as PydanticBase
@@ -41,7 +43,6 @@ from traffic_filter import (
     post_process_prediction,
     should_generate_alert,
     TrafficStats,
-    active_defense,
 )
 
 # ── SIEM imports ─────────────────────────────────────────────
@@ -75,7 +76,7 @@ def send_alert_email(alert_data: Alert, ip_country: str):
     _email_last_sent[ip_key] = now
     try:
         dst  = getattr(alert_data, "dst_ip",   None) or "?"
-        dev  = getattr(alert_data, "device_id", None) or "windows-siem"
+        dev  = getattr(alert_data, "device_id", None) or _SIEM_HOSTNAME
         conf = getattr(alert_data, "confidence", 0) or 0
         sev  = str(getattr(alert_data, "severity", "CRITICAL")).replace("SeverityLevel.", "")
 
@@ -137,7 +138,8 @@ _PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 MODELS_DIR      = os.path.join(_PROJECT_ROOT, "backend", "models")
 _DATA_DIR       = os.path.join(_PROJECT_ROOT, "data")
 PCAP_PATH       = os.path.join(_DATA_DIR, "live_traffic.pcap")
-CAPTURE_INTERFACE = os.getenv("SENTINELIQ_CAPTURE_INTERFACE", "7")  # Ethernet 2 = VirtualBox 192.168.56.x
+CAPTURE_INTERFACE = os.getenv("SENTINELIQ_CAPTURE_INTERFACE", "4")  # Ethernet 2 = VirtualBox 192.168.56.x
+_SIEM_HOSTNAME    = socket.gethostname()  # used as device_id for locally-captured traffic
 CAPTURE_DURATION  = 10    # seconds — reduced for faster detection
 CAPTURE_COOLDOWN  = 0    # no pause between captures
 
@@ -378,9 +380,50 @@ def _build_remote_ubuntu_command(ip: str, action: str) -> str:
     )
 
 
+# ── SSH circuit breaker ───────────────────────────────────────
+# Opens after 3 consecutive failures; auto-resets after 2 minutes.
+_ssh_consec_fails: int = 0
+_ssh_quiet_until:  float = 0.0
+_SSH_OPEN_AFTER   = 3
+_SSH_COOLDOWN     = 120   # seconds before next retry burst
+
+def _ssh_circuit_open() -> bool:
+    return _ssh_consec_fails >= _SSH_OPEN_AFTER and time.time() < _ssh_quiet_until
+
+def _ssh_on_success():
+    global _ssh_consec_fails, _ssh_quiet_until
+    _ssh_consec_fails = 0
+    _ssh_quiet_until  = 0.0
+
+def _ssh_on_failure():
+    global _ssh_consec_fails, _ssh_quiet_until
+    _ssh_consec_fails += 1
+    if _ssh_consec_fails >= _SSH_OPEN_AFTER:
+        _ssh_quiet_until = time.time() + _SSH_COOLDOWN
+        print(f"[SSH] Circuit breaker OPEN — remote response paused {_SSH_COOLDOWN}s "
+              f"(Ubuntu VM unreachable?). Will retry automatically.")
+
+def _build_ssh_base() -> list:
+    """Return the common SSH flags used by all remote calls."""
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=5",   # fail fast if host is unreachable
+        "-p", str(settings.REMOTE_RESPONSE_PORT),
+    ]
+    if settings.REMOTE_RESPONSE_IDENTITY_FILE:
+        cmd.extend(["-i", settings.REMOTE_RESPONSE_IDENTITY_FILE])
+    cmd.append(f"{settings.REMOTE_RESPONSE_USER}@{settings.REMOTE_RESPONSE_HOST}")
+    return cmd
+
+
 def _run_remote_ubuntu_flush() -> bool:
     """Flush the INPUT chain on Ubuntu — removes all SentinelIQ blocks at once."""
     if not _remote_response_enabled():
+        return False
+    if _ssh_circuit_open():
+        print("[SSH] Circuit breaker open — flush skipped")
         return False
     sudo_prefix = "sudo -n " if settings.REMOTE_RESPONSE_USE_SUDO else ""
     backend = (settings.REMOTE_RESPONSE_BACKEND or "iptables").strip().lower()
@@ -388,39 +431,41 @@ def _run_remote_ubuntu_flush() -> bool:
         cmd = f"{sudo_prefix}bash -lc \"yes | ufw reset && ufw --force enable\""
     else:
         cmd = f"{sudo_prefix}bash -lc \"iptables -F INPUT\""
-    ssh_cmd = ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-               "-p", str(settings.REMOTE_RESPONSE_PORT)]
-    if settings.REMOTE_RESPONSE_IDENTITY_FILE:
-        ssh_cmd.extend(["-i", settings.REMOTE_RESPONSE_IDENTITY_FILE])
-    ssh_cmd.append(f"{settings.REMOTE_RESPONSE_USER}@{settings.REMOTE_RESPONSE_HOST}")
-    ssh_cmd.append(cmd)
-    proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=20)
-    return proc.returncode == 0
+    ssh_cmd = _build_ssh_base() + [cmd]
+    try:
+        proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=8)
+        if proc.returncode == 0:
+            _ssh_on_success()
+            return True
+        _ssh_on_failure()
+        return False
+    except subprocess.TimeoutExpired:
+        _ssh_on_failure()
+        print("[SSH] Flush timed out")
+        return False
 
 
 def _run_remote_ubuntu_firewall_action(ip: str, action: str):
     if not _active_defense_on or not _remote_response_enabled() or not _is_blockable_ip(ip):
         return
+    if _ssh_circuit_open():
+        return   # silently skip — circuit is open, logged when it opened
 
     safe_ip = str(ipaddress.ip_address(ip))
-    ssh_cmd = [
-        "ssh",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-p", str(settings.REMOTE_RESPONSE_PORT),
-    ]
-    if settings.REMOTE_RESPONSE_IDENTITY_FILE:
-        ssh_cmd.extend(["-i", settings.REMOTE_RESPONSE_IDENTITY_FILE])
-    ssh_cmd.append(f"{settings.REMOTE_RESPONSE_USER}@{settings.REMOTE_RESPONSE_HOST}")
-    ssh_cmd.append(_build_remote_ubuntu_command(safe_ip, action))
+    ssh_cmd = _build_ssh_base() + [_build_remote_ubuntu_command(safe_ip, action)]
 
-    proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=20)
-    if proc.returncode == 0:
-        print(f"[*] Remote Ubuntu firewall {action} applied for {safe_ip}")
-        return
-
-    detail = (proc.stderr or proc.stdout or "").strip()
-    print(f"[!] Remote Ubuntu firewall {action} failed for {safe_ip}: {detail}")
+    try:
+        proc = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=8)
+        if proc.returncode == 0:
+            _ssh_on_success()
+            print(f"[*] Remote Ubuntu firewall {action} applied for {safe_ip}")
+            return
+        detail = (proc.stderr or proc.stdout or "").strip()
+        _ssh_on_failure()
+        print(f"[!] Remote Ubuntu firewall {action} failed for {safe_ip}: {detail}")
+    except subprocess.TimeoutExpired:
+        _ssh_on_failure()
+        print(f"[!] Remote Ubuntu SSH timed out for {safe_ip}")
 
 
 def _remote_ban_callback(entry):
@@ -503,6 +548,8 @@ def process_thread():
 # =============================================================================
 
 async def _save_alerts_to_postgres(triggered_alerts, unified_log, device_id: str = ""):
+    # Commit the normalized log first in its own transaction so its ID is
+    # stable before we reference it as a FK in the alert rows.
     async with AsyncSessionLocal() as db_session:
         db_log = NormalizedLog(
             source="NETWORK",
@@ -517,8 +564,10 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log, device_id: str
             extra=unified_log.extra or {},
         )
         db_session.add(db_log)
-        await db_session.flush()
+        await db_session.commit()
+        log_id = db_log.id
 
+    async with AsyncSessionLocal() as db_session:
         for alert_data in triggered_alerts:
             enrichment = await threat_intel.enrich_ip(alert_data.src_ip)
             db_alert = Alert(
@@ -533,12 +582,12 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log, device_id: str
                 mitre_tactic=alert_data.mitre_tactic,
                 mitre_technique_id=alert_data.mitre_technique_id,
                 mitre_technique_name=alert_data.mitre_technique_name,
-                ip_country=enrichment.country_code,
+                ip_country=enrichment.country_code or None,
                 ip_isp=enrichment.isp,
                 ip_abuse_score=enrichment.abuse_score,
                 is_known_malicious=enrichment.is_known_malicious,
-                raw_log_id=db_log.id,
-                device_id=device_id or None,
+                raw_log_id=log_id,
+                device_id=device_id or _SIEM_HOSTNAME,
             )
             db_session.add(db_alert)
             await db_session.flush()
@@ -576,7 +625,7 @@ async def _save_alerts_to_postgres(triggered_alerts, unified_log, device_id: str
         await db_session.commit()
 
 
-async def _evaluate_and_save_log_event(event, device_id: str = "") -> bool:
+async def _evaluate_and_save_log_event(event, device_id: str = "", forwarder_ip: str = "") -> bool:
     """Run a ParsedLogEvent through the correlation engine and persist to DB."""
     try:
         _src_map = {
@@ -586,9 +635,13 @@ async def _evaluate_and_save_log_event(event, device_id: str = "") -> bool:
         }
         source = _src_map.get((event.source_type or "").lower(), "NETWORK")
 
+        # For log-based sources (auth.log, syslog), dst_ip is never in the log line.
+        # Use the HTTP client IP (the forwarder machine) as the destination instead.
+        effective_dst = event.dst_ip or forwarder_ip or ""
+
         unified_log = ingestion_pipeline.process_raw(source, {
             "src_ip":      event.src_ip,
-            "dst_ip":      event.dst_ip or "",
+            "dst_ip":      effective_dst,
             "event_type":  event.event_type,
             "username":    event.username,
             "message":     event.message,
@@ -603,15 +656,17 @@ async def _evaluate_and_save_log_event(event, device_id: str = "") -> bool:
             db_log = NormalizedLog(
                 source=source,
                 src_ip=event.src_ip,
-                dst_ip=event.dst_ip or "",
+                dst_ip=effective_dst,
                 event_type=event.event_type,
                 username=event.username,
                 message=event.message,
                 extra=event.extra or {},
             )
             db_session.add(db_log)
-            await db_session.flush()
+            await db_session.commit()
+            log_id = db_log.id
 
+        async with AsyncSessionLocal() as db_session:
             for alert_data in triggered:
                 enrichment = await threat_intel.enrich_ip(alert_data.src_ip)
                 attack_type = EVENT_TYPE_MAPPINGS.get(alert_data.attack_type, alert_data.attack_type)
@@ -630,12 +685,12 @@ async def _evaluate_and_save_log_event(event, device_id: str = "") -> bool:
                     mitre_tactic=alert_data.mitre_tactic,
                     mitre_technique_id=alert_data.mitre_technique_id,
                     mitre_technique_name=alert_data.mitre_technique_name,
-                    ip_country=enrichment.country_code,
+                    ip_country=enrichment.country_code or None,
                     ip_isp=enrichment.isp,
                     ip_abuse_score=enrichment.abuse_score,
                     is_known_malicious=enrichment.is_known_malicious,
-                    raw_log_id=db_log.id,
-                    device_id=device_id or None,
+                    raw_log_id=log_id,
+                    device_id=device_id or _SIEM_HOSTNAME,
                 )
                 db_session.add(row)
                 await db_session.flush()
@@ -905,7 +960,7 @@ def _process_pcap(pcap_file: str):
                     triggered = correlation_engine.process_log(unified_log)
 
                     if triggered:
-                        run_async(_save_alerts_to_postgres(triggered, unified_log, ""))
+                        run_async(_save_alerts_to_postgres(triggered, unified_log, _SIEM_HOSTNAME))
                         for a in triggered:
                             traffic_stats.record_alert()
                             print(f"[{timestamp}] [ALERT] SIEM: {a.title} | {a.mitre_technique_id} | {a.rule.severity}")
@@ -948,7 +1003,7 @@ class BulkLogRequest(PydanticBase):
 
 
 @app.post("/api/logs/ingest")
-async def ingest_log(entry: LogEntry):
+async def ingest_log(entry: LogEntry, request: Request):
     """Ingest a single log line."""
     source = entry.source
     raw    = entry.raw.strip()
@@ -965,7 +1020,8 @@ async def ingest_log(entry: LogEntry):
     if not event:
         return {"status": "skipped", "reason": "unrecognized or benign"}
 
-    fired = await _evaluate_and_save_log_event(event, entry.device_id)
+    client_ip = request.client.host if request.client else ""
+    fired = await _evaluate_and_save_log_event(event, entry.device_id, client_ip)
     return {
         "status": "alert_fired" if fired else "ingested",
         "event_type": event.event_type,
@@ -974,18 +1030,20 @@ async def ingest_log(entry: LogEntry):
 
 
 @app.post("/api/logs/ingest/bulk")
-async def ingest_bulk(request: BulkLogRequest):
+async def ingest_bulk(payload: BulkLogRequest, request: Request):
     """Ingest multiple log lines at once."""
-    if len(request.logs) > 500:
-        raise HTTPException(status_code=413, detail=f"Batch too large: {len(request.logs)} logs (max 500)")
-    results = {"received": len(request.logs), "parsed": 0, "alerts_fired": 0, "skipped": 0}
+    if len(payload.logs) > 500:
+        raise HTTPException(status_code=413, detail=f"Batch too large: {len(payload.logs)} logs (max 500)")
+    results = {"received": len(payload.logs), "parsed": 0, "alerts_fired": 0, "skipped": 0}
 
     if _log_parser is None:
         return {"status": "error", "reason": "log_parser not available"}
 
+    client_ip = request.client.host if request.client else ""
+
     # Parse all lines
     parsed_events = []
-    for entry in request.logs:
+    for entry in payload.logs:
         source = entry.source
         raw    = entry.raw.strip()
         if not raw:
@@ -1002,9 +1060,9 @@ async def ingest_bulk(request: BulkLogRequest):
 
     # Process every event individually so the correlation engine counts
     # each occurrence — the AlertSuppressor prevents alert storms.
-    bulk_device_id = request.device_id
+    bulk_device_id = payload.device_id
     for ev in parsed_events:
-        if await _evaluate_and_save_log_event(ev, bulk_device_id):
+        if await _evaluate_and_save_log_event(ev, bulk_device_id, client_ip):
             results["alerts_fired"] += 1
 
     return {"status": "ok", **results}
@@ -1076,7 +1134,7 @@ async def siem_alerts(
                 "ip_country": a.ip_country,
                 "ip_isp": a.ip_isp,
                 "ip_abuse_score": a.ip_abuse_score,
-                "device_id": a.device_id or "",
+                "device_id": a.device_id or _SIEM_HOSTNAME,
 
                 # [OK] FIX: always UTC ISO
                 "created_at": a.created_at.replace(tzinfo=None).isoformat() + "Z"
@@ -1339,6 +1397,23 @@ async def ingest_pcap_from_ubuntu(request: Request):
     return {"status": "ok", "flows": len(df) if df is not None else 0, "attacks": attack_counts}
 
 
+
+@app.post("/api/auth/login")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    auth = authenticate_user(form_data.username, form_data.password)
+    if not auth:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    access_token = create_access_token(form_data.username)
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/api/auth/me")
+async def read_users_me(current_user: str = Depends(verify_token)):
+    return {"username": current_user} 
+
+    
+
+
 @app.get("/api/stats")
 async def get_stats(days: int = Query(7, ge=1, le=30)):
     from sqlalchemy import select, func
@@ -1457,22 +1532,47 @@ def set_threshold(threshold: float = Query(..., ge=0.5, le=0.95)):
         return {"error": str(e)}
 
 
+@app.post("/api/set-interface")
+def set_interface(interface: str = Query(...)):
+    global CAPTURE_INTERFACE
+    CAPTURE_INTERFACE = interface.strip()
+    print(f"[CONFIG] Capture interface updated to: {CAPTURE_INTERFACE}")
+    return {"status": "success", "interface": CAPTURE_INTERFACE}
+
+
 @app.get("/api/diagnostic")
 async def diagnostic():
     from sqlalchemy import select, func
     from database import Alert as SiemAlert
     try:
-        import joblib
-        scaler        = joblib.load(os.path.join(MODELS_DIR, "scaler.pkl"))
-        label_encoder = joblib.load(os.path.join(MODELS_DIR, "label_encoder.pkl"))
+        n_features  = pred.scaler.n_features_in_
+        n_classes   = len(pred.label_encoder.classes_)
+        threshold   = pred.confidence_threshold
         async with AsyncSessionLocal() as s:
             count_r = await s.execute(select(func.count(SiemAlert.id)))
             alert_count = count_r.scalar()
+        tshark_path = r"C:\Program Files\Wireshark\tshark.exe"
+        model_info = {
+            "expected_features": n_features,
+            "num_classes":       n_classes,
+            "threshold":         threshold,
+        }
         return {
             "status": "operational",
-            "model": {"features": scaler.n_features_in_,
-                      "classes": len(label_encoder.classes_),
-                      "threshold": pred.confidence_threshold},
+            "model": {"features": n_features, "classes": n_classes, "threshold": threshold},
+            "model_info": model_info,
+            "model_files": {
+                "model":         os.path.exists(os.path.join(MODELS_DIR, "lstm_cicids.pth")),
+                "scaler":        os.path.exists(os.path.join(MODELS_DIR, "scaler.pkl")),
+                "label_encoder": os.path.exists(os.path.join(MODELS_DIR, "label_encoder.pkl")),
+            },
+            "tshark_available": os.path.exists(tshark_path),
+            "capture_stats": {
+                "total_captures":    session_stats.get("captures", 0),
+                "total_flows":       session_stats.get("flows_processed", 0),
+                "total_predictions": session_stats.get("flows_processed", 0),
+                "detection_rate":    {"malicious": int(alert_count)},
+            },
             "database": {"total_alerts": alert_count},
             "session": session_stats,
             "interface": CAPTURE_INTERFACE,
@@ -1696,16 +1796,18 @@ async def flush_device_blocks(device_id: str = Query(...)):
         # Remove from in-memory ban cache
         active_defense.unban_ip(ip)
 
-        # Remove Windows Firewall rule
-        try:
-            rule = f"SentinelIQ_Block_{ip.replace('.', '_')}"
-            subprocess.run(
-                f'netsh advfirewall firewall delete rule name="{rule}"',
-                shell=True, capture_output=True
-            )
-            cleared_win += 1
-        except Exception:
-            pass
+        # Remove Windows Firewall rule (must use same name pattern as _apply_windows_firewall_block)
+        if _RUNNING_AS_ADMIN:
+            try:
+                rule_name = _firewall_rule_name(ip)
+                subprocess.run(
+                    ["powershell", "-Command",
+                     f'Remove-NetFirewallRule -DisplayName "{rule_name}" -ErrorAction SilentlyContinue'],
+                    capture_output=True, text=True, timeout=10
+                )
+                cleared_win += 1
+            except Exception:
+                pass
 
         # Remote iptables unban — only when this device matches the configured SSH host
         if device_id != "__windows__" and _remote_response_enabled():

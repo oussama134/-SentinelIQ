@@ -318,8 +318,8 @@ if __name__ == "__main__":
                         help="Disable packet capture (log forwarding only)")
     parser.add_argument("--iface",     type=str, default=None,
                         help="Network interface for tcpdump (auto-detected if not set)")
-    parser.add_argument("--device-id", type=str, default=socket.gethostname(),
-                        help="Unique device identifier sent with every payload (default: hostname)")
+    parser.add_argument("--device-id", type=str, default="oracle-server",
+                        help="Unique device identifier sent with every payload (default: oracle-server)")
     args = parser.parse_args()
 
     device_id = args.device_id

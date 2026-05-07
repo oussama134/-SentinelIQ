@@ -5,6 +5,53 @@
 import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
 import Globe from 'react-globe.gl';
 
+// ── Country code → full name ──────────────────────────────────────────────────
+const COUNTRY_NAMES = {
+  AF:'Afghanistan',AL:'Albania',DZ:'Algeria',AO:'Angola',AR:'Argentina',
+  AM:'Armenia',AU:'Australia',AT:'Austria',AZ:'Azerbaijan',BH:'Bahrain',
+  BD:'Bangladesh',BY:'Belarus',BE:'Belgium',BJ:'Benin',BT:'Bhutan',
+  BO:'Bolivia',BA:'Bosnia and Herzegovina',BW:'Botswana',BR:'Brazil',
+  BG:'Bulgaria',KH:'Cambodia',CM:'Cameroon',CA:'Canada',CL:'Chile',
+  CN:'China',CO:'Colombia',CG:'Congo',CR:'Costa Rica',HR:'Croatia',
+  CU:'Cuba',CY:'Cyprus',CZ:'Czechia',DK:'Denmark',DO:'Dominican Republic',
+  EC:'Ecuador',EG:'Egypt',SV:'El Salvador',EE:'Estonia',ET:'Ethiopia',
+  FI:'Finland',FR:'France',GA:'Gabon',GE:'Georgia',DE:'Germany',GH:'Ghana',
+  GR:'Greece',GT:'Guatemala',HN:'Honduras',HK:'Hong Kong',HU:'Hungary',
+  IN:'India',ID:'Indonesia',IR:'Iran',IQ:'Iraq',IE:'Ireland',IL:'Israel',
+  IT:'Italy',JM:'Jamaica',JP:'Japan',JO:'Jordan',KZ:'Kazakhstan',KE:'Kenya',
+  KP:'North Korea',KR:'South Korea',KW:'Kuwait',LV:'Latvia',LB:'Lebanon',
+  LY:'Libya',LT:'Lithuania',LU:'Luxembourg',MY:'Malaysia',MX:'Mexico',
+  MD:'Moldova',MA:'Morocco',MZ:'Mozambique',MM:'Myanmar',NP:'Nepal',
+  NL:'Netherlands',NZ:'New Zealand',NI:'Nicaragua',NG:'Nigeria',NO:'Norway',
+  OM:'Oman',PK:'Pakistan',PS:'Palestine',PA:'Panama',PY:'Paraguay',
+  PE:'Peru',PH:'Philippines',PL:'Poland',PT:'Portugal',QA:'Qatar',
+  RO:'Romania',RU:'Russia',SA:'Saudi Arabia',SN:'Senegal',RS:'Serbia',
+  SG:'Singapore',SK:'Slovakia',SI:'Slovenia',ZA:'South Africa',ES:'Spain',
+  LK:'Sri Lanka',SE:'Sweden',CH:'Switzerland',SY:'Syria',TW:'Taiwan',
+  TJ:'Tajikistan',TZ:'Tanzania',TH:'Thailand',TN:'Tunisia',TR:'Turkey',
+  TM:'Turkmenistan',UG:'Uganda',UA:'Ukraine',AE:'United Arab Emirates',
+  GB:'United Kingdom',US:'United States',UY:'Uruguay',UZ:'Uzbekistan',
+  VN:'Vietnam',YE:'Yemen',ZM:'Zambia',ZW:'Zimbabwe',
+};
+
+// Reverse map: full name (lowercase) → 2-letter code
+const NAME_TO_CC = Object.fromEntries(
+  Object.entries(COUNTRY_NAMES).map(([cc, name]) => [name.toLowerCase(), cc])
+);
+
+// Resolve ip_country (either "NL" or "Netherlands") → 2-letter code for COORDS lookup
+function resolveCC(ipCountry) {
+  if (!ipCountry) return '';
+  const trimmed = ipCountry.trim();
+  const upper = trimmed.toUpperCase();
+  if (upper.length === 2) return upper;                          // already a code
+  return NAME_TO_CC[trimmed.toLowerCase()] || '';               // full name → code
+}
+
+function countryLabel(cc) {
+  return COUNTRY_NAMES[cc] || cc;
+}
+
 // ── Country code → [lat, lng] ─────────────────────────────────────────────────
 const COORDS = {
   AF:[33.93,67.70],AL:[41.15,20.17],DZ:[28.03,1.65],AO:[-11.20,17.87],AR:[-38.41,-63.61],
@@ -114,7 +161,7 @@ function LocationPanel({ location, onClose }) {
                 flexShrink: 0,
               }} />
               <span style={{ color: '#c9d1d9', fontSize: 15, fontWeight: 700 }}>
-                {location.cc}
+                {countryLabel(location.cc)}
               </span>
               <span style={{
                 background: `${col}22`, color: col,
@@ -306,7 +353,7 @@ export default function ThreatGlobe({ alerts }) {
     let privateCount = 0;
 
     alerts.forEach(a => {
-      const cc  = (a.ip_country || '').toUpperCase();
+      const cc  = resolveCC(a.ip_country);
       const sev = (a.severity || '').replace('SeverityLevel.', '') || 'LOW';
 
       if (!cc || !COORDS[cc]) { privateCount++; return; }
@@ -407,7 +454,7 @@ export default function ThreatGlobe({ alerts }) {
           animation: 'tgFadeIn .15s ease',
         }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: '#c9d1d9', marginBottom: 8 }}>
-            {hovered.cc}
+            {countryLabel(hovered.cc)}
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
             {[

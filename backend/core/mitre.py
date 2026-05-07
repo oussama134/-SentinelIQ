@@ -1,7 +1,6 @@
 """
 SentinelIQ — MITRE ATT&CK Mapping
 Maps your 15 CICIDS2017 classes → MITRE tactics & techniques
-This is what makes your project look enterprise-grade
 Reference: https://attack.mitre.org
 """
 from dataclasses import dataclass

@@ -13,6 +13,31 @@ const SEV = {
   INFO:     { fg: '#58a6ff', bg: 'rgba(88,166,255,.12)' },
 };
 const normSev = s => (s || '').replace('SeverityLevel.', '');
+
+const displayDevice = id => id || '—';
+
+const COUNTRY_NAMES = {
+  AF:'Afghanistan',AL:'Albania',DZ:'Algeria',AR:'Argentina',AU:'Australia',
+  AT:'Austria',AZ:'Azerbaijan',BD:'Bangladesh',BE:'Belgium',BR:'Brazil',
+  BG:'Bulgaria',CA:'Canada',CL:'Chile',CN:'China',CO:'Colombia',HR:'Croatia',
+  CZ:'Czechia',DK:'Denmark',EG:'Egypt',EE:'Estonia',FI:'Finland',FR:'France',
+  DE:'Germany',GH:'Ghana',GR:'Greece',HK:'Hong Kong',HU:'Hungary',IN:'India',
+  ID:'Indonesia',IR:'Iran',IQ:'Iraq',IE:'Ireland',IL:'Israel',IT:'Italy',
+  JP:'Japan',JO:'Jordan',KZ:'Kazakhstan',KE:'Kenya',KR:'South Korea',
+  KW:'Kuwait',LV:'Latvia',LB:'Lebanon',LT:'Lithuania',LU:'Luxembourg',
+  MY:'Malaysia',MX:'Mexico',MA:'Morocco',NL:'Netherlands',NZ:'New Zealand',
+  NG:'Nigeria',NO:'Norway',PK:'Pakistan',PE:'Peru',PH:'Philippines',PL:'Poland',
+  PT:'Portugal',QA:'Qatar',RO:'Romania',RU:'Russia',SA:'Saudi Arabia',
+  SG:'Singapore',SK:'Slovakia',ZA:'South Africa',ES:'Spain',SE:'Sweden',
+  CH:'Switzerland',TW:'Taiwan',TH:'Thailand',TN:'Tunisia',TR:'Turkey',
+  UA:'Ukraine',AE:'United Arab Emirates',GB:'United Kingdom',
+  US:'United States',VN:'Vietnam',
+};
+const displayCountry = v => {
+  if (!v) return '—';
+  if (v.length > 2) return v;
+  return COUNTRY_NAMES[v.toUpperCase()] || v;
+};
 const sf = k => (SEV[normSev(k)] || SEV.INFO).fg;
 const sb = k => (SEV[normSev(k)] || SEV.INFO).bg;
 
@@ -423,10 +448,12 @@ export default function AlertDetail({ alert, onClose, onRefresh }) {
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 16px' }}>
                 {[
                   ['Source IP',    alert.src_ip,                  'mono'],
+                  ['Destination IP', alert.dst_ip && alert.dst_ip !== '0.0.0.0' ? alert.dst_ip : '—', 'mono'],
+                  ['Device',       displayDevice(alert.device_id),  'device'],
                   ['Attack Type',  alert.attack_type],
-                  ['MITRE ID',     alert.mitre_technique_id,      'blue'],
+                  ['MITRE ID',     alert.mitre_technique_id,       'blue'],
                   ['Tactic',       alert.mitre_tactic],
-                  ['Country',      alert.ip_country || '—'],
+                  ['Country',      displayCountry(alert.ip_country)],
                   ['ISP',          alert.ip_isp || '—'],
                   ['Abuse Score',  alert.ip_abuse_score != null ? `${alert.ip_abuse_score}/100` : '—'],
                   ['Firewall',     alert.is_blocked ? '🔒 Blocked' : '⚡ Active'],
@@ -435,12 +462,22 @@ export default function AlertDetail({ alert, onClose, onRefresh }) {
                 ].map(([k, v, style]) => (
                   <div key={k}>
                     <div style={{ color: '#6e7681', fontSize: 10, marginBottom: 2 }}>{k}</div>
-                    <div style={{
-                      color: style === 'mono' ? '#e6edf3' : style === 'blue' ? '#58a6ff' : '#c9d1d9',
-                      fontFamily: style === 'mono' ? 'monospace' : 'inherit',
-                      fontWeight: style === 'blue' ? 700 : 400,
-                      fontSize: 12,
-                    }}>{v || '—'}</div>
+                    {style === 'device' ? (
+                      <span style={{
+                        display: 'inline-block',
+                        background: 'rgba(120,92,255,.15)', color: '#a78bfa',
+                        border: '1px solid rgba(120,92,255,.35)',
+                        borderRadius: 4, padding: '1px 7px',
+                        fontSize: 11, fontFamily: 'monospace', fontWeight: 700,
+                      }}>{v || '—'}</span>
+                    ) : (
+                      <div style={{
+                        color: style === 'mono' ? '#e6edf3' : style === 'blue' ? '#58a6ff' : '#c9d1d9',
+                        fontFamily: style === 'mono' ? 'monospace' : 'inherit',
+                        fontWeight: style === 'blue' ? 700 : 400,
+                        fontSize: 12,
+                      }}>{v || '—'}</div>
+                    )}
                   </div>
                 ))}
               </div>

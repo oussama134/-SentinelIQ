@@ -8,6 +8,8 @@ export default function ConfigPanel() {
   const [diagnostic, setDiagnostic] = useState(null);
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [iface, setIface] = useState('');
+  const [ifaceLoading, setIfaceLoading] = useState(false);
 
   useEffect(() => {
     fetchDiagnostic();
@@ -23,6 +25,9 @@ export default function ConfigPanel() {
       // Set current threshold from diagnostic if available
       if (data.model_info?.threshold) {
         setThreshold(data.model_info.threshold);
+      }
+      if (data.interface) {
+        setIface(data.interface);
       }
     } catch (error) {
       console.error('Error fetching diagnostic:', error);
@@ -51,6 +56,28 @@ export default function ConfigPanel() {
       setTimeout(() => setStatus(null), 3000);
     }
     setLoading(false);
+  };
+
+  const updateInterface = async (newIface) => {
+    if (!newIface.trim()) return;
+    setIfaceLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/set-interface?interface=${encodeURIComponent(newIface.trim())}`, {
+        method: 'POST'
+      });
+      const data = await response.json();
+      if (data.status === 'success') {
+        setStatus({ type: 'success', message: `Capture interface set to "${data.interface}"` });
+        setIface(data.interface);
+      } else {
+        setStatus({ type: 'error', message: data.error || 'Failed to update interface' });
+      }
+      setTimeout(() => setStatus(null), 3000);
+    } catch {
+      setStatus({ type: 'error', message: 'Network error' });
+      setTimeout(() => setStatus(null), 3000);
+    }
+    setIfaceLoading(false);
   };
 
   const getThresholdInfo = (value) => {
@@ -116,6 +143,38 @@ export default function ConfigPanel() {
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Capture Interface Control — always visible, independent of diagnostic */}
+        <div className="bg-white rounded-lg shadow-lg p-6 lg:col-span-2">
+          <div className="flex items-center gap-2 mb-4">
+            <Info className="text-purple-600" size={24} />
+            <h2 className="text-xl font-bold text-gray-800">Capture Interface</h2>
+          </div>
+          <div className="flex gap-3 items-end">
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Interface number or name
+              </label>
+              <input
+                type="text"
+                value={iface}
+                onChange={(e) => setIface(e.target.value)}
+                placeholder="e.g. 4 or Ethernet 2"
+                className="w-full border border-gray-300 rounded px-3 py-2 text-sm text-gray-800 focus:outline-none focus:border-purple-500"
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                Run <code className="bg-gray-100 px-1 rounded">tshark -D</code> in a terminal to list available interfaces
+              </p>
+            </div>
+            <button
+              onClick={() => updateInterface(iface)}
+              disabled={ifaceLoading}
+              className="bg-purple-600 hover:bg-purple-700 text-white font-semibold px-6 py-2 rounded-lg transition-colors disabled:opacity-50"
+            >
+              {ifaceLoading ? 'Applying...' : 'Apply'}
+            </button>
+          </div>
+        </div>
+
         {/* Confidence Threshold Control */}
         <div className="bg-white rounded-lg shadow-lg p-6">
           <div className="flex items-center gap-2 mb-4">
@@ -311,13 +370,6 @@ export default function ConfigPanel() {
                 )}
               </div>
 
-              {/* Interface Info */}
-              {diagnostic.interface && (
-                <div className="flex items-center justify-between p-3 bg-gray-50 rounded">
-                  <span className="text-sm text-gray-600">Capture Interface:</span>
-                  <span className="font-medium text-gray-800">{diagnostic.interface}</span>
-                </div>
-              )}
             </div>
           ) : (
             <div className="text-center py-8 text-gray-500">
