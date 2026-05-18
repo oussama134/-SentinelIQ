@@ -1,6 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-
-const API = 'http://localhost:8000';
+import { API, apiFetch } from '../api';
 
 const EVENT_COLOR = {
   ddos: '#f85149', dos_hulk: '#f85149', dos_slowloris: '#f0883e',
@@ -36,7 +35,7 @@ export default function LogExplorer() {
     try {
       const p = new URLSearchParams({ limit: 300, minutes });
       if (sourceFilter) p.set('source', sourceFilter);
-      const res = await fetch(`${API}/api/logs?${p}`);
+      const res = await apiFetch(`${API}/api/logs?${p}`);
       const data = await res.json();
       if (data.logs) setLogs(data.logs);
     } catch {}

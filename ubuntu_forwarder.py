@@ -47,6 +47,7 @@ LOG_FILES = [
 ]
 
 DEFAULT_SIEM_URL     = "http://192.168.56.1:8000"
+DEFAULT_API_KEY      = os.environ.get("SENTINELIQ_API_KEY", "sentineliq-forwarder-default-key")
 FORWARD_TIMEOUT      = 15   # ngrok tunnels need more time
 CONNECTIVITY_TIMEOUT = 8
 FLUSH_INTERVAL       = 2.0  # 2s batching reduces request rate vs ngrok limits
@@ -55,7 +56,7 @@ RETRY_DELAY          = 15   # back off longer after SSL EOF
 
 # Packet capture settings
 PCAP_INTERFACE   = "enp0s8"
-PCAP_WINDOW_SEC  = 30       # 30s windows = 2 req/min instead of 6 → stays under ngrok limits
+PCAP_WINDOW_SEC  = 2        # 2s windows — rapid detection latency
 PCAP_SLOT_COUNT  = 3
 
 
@@ -77,12 +78,16 @@ def check_connectivity(siem_url):
         return False
 
 
-def forward_logs(siem_url, payload, device_id=""):
+def forward_logs(siem_url, payload, device_id="", api_key=""):
     url  = f"{normalize_base_url(siem_url)}/api/logs/ingest/bulk"
     data = json.dumps({"logs": payload, "device_id": device_id}).encode("utf-8")
     req  = urllib.request.Request(
         url, data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "SentinelAgent/1.0"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "SentinelAgent/1.0",
+            "X-Api-Key": api_key or DEFAULT_API_KEY,
+        },
     )
     for attempt in range(2):  # one retry on SSL EOF (ngrok tunnel reset)
         try:
@@ -98,7 +103,7 @@ def forward_logs(siem_url, payload, device_id=""):
     return False, "max retries"
 
 
-def forward_pcap(siem_url, pcap_path, device_id=""):
+def forward_pcap(siem_url, pcap_path, device_id="", api_key=""):
     url = f"{normalize_base_url(siem_url)}/api/pcap/ingest"
     try:
         with open(pcap_path, "rb") as f:
@@ -111,6 +116,7 @@ def forward_pcap(siem_url, pcap_path, device_id=""):
                 "Content-Type": "application/octet-stream",
                 "User-Agent": "SentinelAgent/1.0",
                 "X-Device-ID": device_id,
+                "X-Api-Key": api_key or DEFAULT_API_KEY,
             },
         )
         for attempt in range(2):
@@ -167,7 +173,7 @@ def _detect_interface():
 
 # ── Log tail thread ───────────────────────────────────────────────────────────
 
-def tail_file(siem_url, log_info, device_id=""):
+def tail_file(siem_url, log_info, device_id="", api_key=""):
     path       = log_info["path"]
     source     = log_info["source"]
     pre_filter = log_info.get("filter")   # optional callable(line) -> bool
@@ -237,7 +243,7 @@ def tail_file(siem_url, log_info, device_id=""):
             or len(buffer) >= MAX_BATCH_SIZE
         ):
             batch   = list(buffer[:MAX_BATCH_SIZE])
-            success, detail = forward_logs(siem_url, batch, device_id)
+            success, detail = forward_logs(siem_url, batch, device_id, api_key)
 
             if success:
                 del buffer[:len(batch)]
@@ -256,7 +262,7 @@ def tail_file(siem_url, log_info, device_id=""):
 
 # ── PCAP capture thread ───────────────────────────────────────────────────────
 
-def pcap_capture_thread(siem_url, device_id=""):
+def pcap_capture_thread(siem_url, device_id="", api_key=""):
     iface = _detect_interface()
     print(f"[*] PCAP capture started on {iface} → forwarding to {siem_url}/api/pcap/ingest")
 
@@ -295,7 +301,7 @@ def pcap_capture_thread(siem_url, device_id=""):
             continue
 
         size_kb = os.path.getsize(pcap_file) // 1024
-        ok, detail = forward_pcap(siem_url, pcap_file, device_id)
+        ok, detail = forward_pcap(siem_url, pcap_file, device_id, api_key)
         if ok:
             try:
                 resp    = json.loads(detail)
@@ -318,11 +324,14 @@ if __name__ == "__main__":
                         help="Disable packet capture (log forwarding only)")
     parser.add_argument("--iface",     type=str, default=None,
                         help="Network interface for tcpdump (auto-detected if not set)")
-    parser.add_argument("--device-id", type=str, default="oracle-server",
-                        help="Unique device identifier sent with every payload (default: oracle-server)")
+    parser.add_argument("--device-id", type=str, default="ubuntu-vm",
+                        help="Unique device identifier sent with every payload (default: ubuntu-vm)")
+    parser.add_argument("--api-key", type=str, default=DEFAULT_API_KEY,
+                        help="API key for authenticating with the SIEM backend (env: SENTINELIQ_API_KEY)")
     args = parser.parse_args()
 
     device_id = args.device_id
+    api_key   = args.api_key
     if args.iface:
         PCAP_INTERFACE = args.iface
 
@@ -341,12 +350,12 @@ if __name__ == "__main__":
     threads = []
 
     for log_file in LOG_FILES:
-        t = threading.Thread(target=tail_file, args=(args.siem, log_file, device_id), daemon=True)
+        t = threading.Thread(target=tail_file, args=(args.siem, log_file, device_id, api_key), daemon=True)
         t.start()
         threads.append(t)
 
     if not args.no_pcap:
-        pt = threading.Thread(target=pcap_capture_thread, args=(args.siem, device_id), daemon=True)
+        pt = threading.Thread(target=pcap_capture_thread, args=(args.siem, device_id, api_key), daemon=True)
         pt.start()
         threads.append(pt)
 

@@ -2,8 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   BarChart, Bar, Cell, XAxis, Tooltip as RTooltip, ResponsiveContainer,
 } from 'recharts';
-
-const API = 'http://localhost:8000';
+import { API, apiFetch } from '../api';
 
 const SEV = {
   CRITICAL: { fg: '#f85149', bg: 'rgba(248,81,73,.12)' },
@@ -337,7 +336,7 @@ export default function AlertDetail({ alert, onClose, onRefresh }) {
   async function loadContext() {
     setLoading(true);
     try {
-      const res = await fetch(`${API}/api/siem/alerts/${alert.id}/context`);
+      const res = await apiFetch(`${API}/api/siem/alerts/${alert.id}/context`);
       const data = await res.json();
       setContext(data);
     } catch {}
@@ -348,7 +347,7 @@ export default function AlertDetail({ alert, onClose, onRefresh }) {
     setActionMsg(`${label}...`);
     setActionErr(false);
     try {
-      const res = await fetch(url, { method });
+      const res = await apiFetch(url, { method });
       const data = await res.json();
       if (data.success || data.status === 'success') {
         setActionMsg(`Done: ${data.blocked_ip || data.unblocked_ip || label}`);

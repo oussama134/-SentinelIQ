@@ -26,9 +26,9 @@ import time
 import sys
 from datetime import datetime
 
-API = "http://localhost:8000"
-INGEST  = f"{API}/api/logs/ingest"
+API     = "http://localhost:8000"
 BULK    = f"{API}/api/logs/ingest/bulk"
+API_KEY = "sentineliq-forwarder-default-key"   # matches FORWARDER_API_KEY in config
 
 ATTACKER_IPS = [
     "23.95.114.30", "185.220.101.45", "159.203.67.89",
@@ -55,7 +55,8 @@ def _nginx_ts():
 
 def _send_bulk(logs: list[dict]) -> bool:
     try:
-        r = requests.post(BULK, json={"logs": logs}, timeout=5)
+        r = requests.post(BULK, json={"logs": logs}, timeout=5,
+                          headers={"X-Api-Key": API_KEY})
         return r.status_code == 200
     except Exception as e:
         print(f"  ❌ {e}")
@@ -231,9 +232,10 @@ SCENARIOS = {
 if __name__ == "__main__":
     print(BANNER)
 
-    # Connectivity check
+    # Connectivity check (/ is the public health endpoint)
     try:
-        r = requests.get(f"{API}/api/diagnostic", timeout=3)
+        r = requests.get(f"{API}/", timeout=3)
+        r.raise_for_status()
         print(f"✅ Connected to SentinelIQ at {API}\n")
     except Exception:
         print(f"❌ Cannot reach {API} — is uvicorn running?")
