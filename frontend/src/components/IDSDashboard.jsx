@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
 import { AlertTriangle, Shield, Activity, TrendingUp, RefreshCw, Settings, Download, Filter, X, Calendar, Search } from 'lucide-react';
-
-const API_BASE = 'http://localhost:8000';
+import { API as API_BASE, apiFetch } from '../api';
 
 const ATTACK_COLORS = {
   'BENIGN': '#10b981',
@@ -54,7 +53,7 @@ export default function AdvancedDashboard() {
 
   const fetchDashboard = async () => {
     try {
-      const response = await fetch(`${API_BASE}/api/dashboard`);
+      const response = await apiFetch(`${API_BASE}/api/dashboard`);
       const result = await response.json();
       setData(result);
       setLastUpdate(new Date());
@@ -67,7 +66,7 @@ export default function AdvancedDashboard() {
 
   const fetchStats = async (days = statsDays) => {
     try {
-      const response = await fetch(`${API_BASE}/api/stats?days=${days}`);
+      const response = await apiFetch(`${API_BASE}/api/stats?days=${days}`);
       const result = await response.json();
       setStats(result);
     } catch (error) {
@@ -82,7 +81,7 @@ export default function AdvancedDashboard() {
         if (value) params.append(key, value);
       });
       
-      const response = await fetch(`${API_BASE}/api/alerts?${params}`);
+      const response = await apiFetch(`${API_BASE}/api/alerts?${params}`);
       const result = await response.json();
       setData(prev => ({ ...prev, alerts: result.alerts || [] }));
       setShowFilters(false);
@@ -108,7 +107,7 @@ export default function AdvancedDashboard() {
 
   const acknowledgeAlert = async (alertId) => {
     try {
-      await fetch(`${API_BASE}/api/alerts/${alertId}/acknowledge`, { method: 'POST' });
+      await apiFetch(`${API_BASE}/api/alerts/${alertId}/acknowledge`, { method: 'POST' });
       fetchDashboard();
     } catch (error) {
       console.error('Error acknowledging alert:', error);

@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Settings, Sliders, Info, CheckCircle, AlertTriangle, ArrowLeft } from 'lucide-react';
-
-const API_BASE = 'http://localhost:8000';
+import { API as API_BASE, apiFetch } from '../api';
 
 export default function ConfigPanel() {
   const [threshold, setThreshold] = useState(0.75);
@@ -17,7 +16,7 @@ export default function ConfigPanel() {
 
   const fetchDiagnostic = async () => {
     try {
-      const response = await fetch(`${API_BASE}/api/diagnostic`);
+      const response = await apiFetch(`${API_BASE}/api/diagnostic`);
       if (!response.ok) throw new Error('Failed to fetch diagnostic');
       const data = await response.json();
       setDiagnostic(data);
@@ -38,7 +37,7 @@ export default function ConfigPanel() {
   const updateThreshold = async (newThreshold) => {
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/api/set-threshold?threshold=${newThreshold}`, {
+      const response = await apiFetch(`${API_BASE}/api/set-threshold?threshold=${newThreshold}`, {
         method: 'POST'
       });
       const data = await response.json();
@@ -62,7 +61,7 @@ export default function ConfigPanel() {
     if (!newIface.trim()) return;
     setIfaceLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/api/set-interface?interface=${encodeURIComponent(newIface.trim())}`, {
+      const response = await apiFetch(`${API_BASE}/api/set-interface?interface=${encodeURIComponent(newIface.trim())}`, {
         method: 'POST'
       });
       const data = await response.json();

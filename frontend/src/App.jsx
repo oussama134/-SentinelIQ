@@ -13,8 +13,7 @@ import {
   BarChart, Bar, Cell, AreaChart, Area,
   XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from 'recharts';
-
-const API = 'http://localhost:8000';
+import { API, apiFetch, login as apiLogin, getToken, getValidToken, clearToken } from './api';
 
 // ── palette ──────────────────────────────────────────────────────────────────
 const SEV = {
@@ -651,7 +650,59 @@ function FlushOption({ label, sublabel, active, danger, onClick }) {
   );
 }
 
+// ── Login screen ─────────────────────────────────────────────────────────────
+function LoginScreen({ onLogin }) {
+  const [user, setUser]   = useState('');
+  const [pass, setPass]   = useState('');
+  const [err,  setErr]    = useState('');
+  const [busy, setBusy]   = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    try {
+      await apiLogin(user, pass);
+      onLogin();
+    } catch (ex) {
+      setErr(ex.message || 'Login failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inp = { background: '#0d1117', border: '1px solid #30363d', borderRadius: 6,
+    color: '#c9d1d9', padding: '8px 12px', width: '100%', boxSizing: 'border-box', fontSize: 14 };
+
+  return (
+    <div style={{ minHeight: '100vh', background: '#010409', display: 'flex',
+      alignItems: 'center', justifyContent: 'center', fontFamily: 'monospace' }}>
+      <form onSubmit={submit} style={{ background: '#0d1117', border: '1px solid #30363d',
+        borderRadius: 12, padding: 40, width: 340, display: 'flex', flexDirection: 'column', gap: 16 }}>
+        <div style={{ color: '#58a6ff', fontSize: 22, fontWeight: 700, textAlign: 'center' }}>
+          SentinelIQ
+        </div>
+        <div style={{ color: '#6e7681', fontSize: 12, textAlign: 'center', marginTop: -8 }}>
+          SOC Dashboard — Login
+        </div>
+        <input style={inp} placeholder="Username" value={user}
+          onChange={e => setUser(e.target.value)} autoFocus />
+        <input style={inp} type="password" placeholder="Password" value={pass}
+          onChange={e => setPass(e.target.value)} />
+        {err && <div style={{ color: '#f85149', fontSize: 12 }}>{err}</div>}
+        <button type="submit" disabled={busy} style={{
+          background: '#1f6feb', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '10px 0', fontSize: 14, fontWeight: 600, cursor: busy ? 'default' : 'pointer',
+          opacity: busy ? 0.7 : 1,
+        }}>
+          {busy ? 'Signing in…' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 export default function App() {
+  const [token,     setToken]     = useState(() => getValidToken());
   const [tab,       setTab]       = useState('alerts');
   const [alerts,    setAlerts]    = useState([]);
   const [dashboard, setDashboard] = useState(null);
@@ -681,6 +732,13 @@ export default function App() {
   const flushDropRef  = useRef(null);
   const adPanelRef    = useRef(null);
 
+  // Token expiry — api.js dispatches this event on any 401
+  useEffect(() => {
+    const handler = () => setToken(null);
+    window.addEventListener('sentineliq:logout', handler);
+    return () => window.removeEventListener('sentineliq:logout', handler);
+  }, []);
+
   // Clock tick
   useEffect(() => {
     const t = setInterval(() => setClock(clockNow()), 1000);
@@ -707,7 +765,7 @@ export default function App() {
   // ── Device states (active defense per-machine) ───────────────────────────
   const fetchDeviceStates = useCallback(async () => {
     try {
-      const r = await fetch(`${API}/api/active-defense/device-states`);
+      const r = await apiFetch(`${API}/api/active-defense/device-states`);
       const d = await r.json();
       setDeviceStates(d);
       setAdEnabled(d.global);
@@ -737,7 +795,7 @@ export default function App() {
       const endpoint = !target
         ? `${API}/api/active-defense/flush-all`
         : `${API}/api/active-defense/flush-device?device_id=${encodeURIComponent(target)}`;
-      await fetch(endpoint, { method: 'POST' });
+      await apiFetch(endpoint, { method: 'POST' });
       await fetchData();
     } catch {}
     setFlushing(false);
@@ -745,7 +803,7 @@ export default function App() {
 
   const toggleDeviceDefense = async (deviceId, enabled) => {
     try {
-      await fetch(
+      await apiFetch(
         `${API}/api/active-defense/toggle-device?device_id=${encodeURIComponent(deviceId)}&enabled=${enabled}`,
         { method: 'POST' }
       );
@@ -759,8 +817,8 @@ export default function App() {
   const fetchData = useCallback(async () => {
     try {
       const [ar, dr] = await Promise.allSettled([
-        fetch(`${API}/api/siem/alerts?limit=150`).then(r => r.json()),
-        fetch(`${API}/api/siem/dashboard`).then(r => r.json()),
+        apiFetch(`${API}/api/siem/alerts?limit=150`).then(r => r.json()),
+        apiFetch(`${API}/api/siem/dashboard`).then(r => r.json()),
       ]);
 
       // Keep defense toggle in sync — catches backend restarts resetting state to ON
@@ -789,7 +847,7 @@ export default function App() {
 
     // ── IP ban notifications ────────────────────────────────────────
     try {
-      const bd = await fetch(`${API}/api/active-defense/bans`).then(r => r.json());
+      const bd = await apiFetch(`${API}/api/active-defense/bans`).then(r => r.json());
       const ipBans = (bd.bans || []).filter(b => b.ban_type === 'IP');
       // key = identifier + banned_at so a re-ban of the same IP after expiry fires again
       const keys = new Set(ipBans.map(b => `${b.identifier}|${b.banned_at}`));
@@ -803,7 +861,7 @@ export default function App() {
 
     // ── Kill switch notifications ───────────────────────────────────
     try {
-      const ks = await fetch(`${API}/api/kill-switch/status`).then(r => r.json());
+      const ks = await apiFetch(`${API}/api/kill-switch/status`).then(r => r.json());
       const log = ks.audit_log || [];
       if (prevKsLen.current !== null && log.length > prevKsLen.current) {
         log.slice(prevKsLen.current).forEach(e => {
@@ -842,6 +900,10 @@ export default function App() {
 
   // Sorted list of device_ids that appear in the current alert set
   const devices = [...new Set(alerts.map(a => a.device_id).filter(Boolean))].sort();
+
+  if (!token) return (
+    <LoginScreen onLogin={() => setToken(getValidToken())} />
+  );
 
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', flexDirection: 'column', gap: 14, background: '#060b14' }}>

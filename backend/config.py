@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str = "dev-secret-key-change-in-production"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
+    ADMIN_PASSWORD_HASH: str = "$2b$12$E37ut6Q29GXrtOmXfyRi9.qzWDUKpI3JUNQId/E4VBS/j0a/Mrpg."
+    FORWARDER_API_KEY: str = "sentineliq-forwarder-default-key"
 
     # ML Model paths
     MODEL_PATH: str = "./ml/models/lstm_model.pkl"

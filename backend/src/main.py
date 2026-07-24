@@ -19,7 +19,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from threading import Thread, Lock
 from collections import Counter, defaultdict
-from core.auth  import verify_token, authenticate_user, create_access_token
+from core.auth  import verify_token, authenticate_user, create_access_token, decode_token
 from fastapi.security import OAuth2PasswordRequestForm
 import warnings
 from sklearn.exceptions import InconsistentVersionWarning
@@ -27,7 +27,8 @@ warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel as PydanticBase
 
 # ── Path setup ───────────────────────────────────────────────
@@ -138,7 +139,7 @@ _PROJECT_ROOT   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 MODELS_DIR      = os.path.join(_PROJECT_ROOT, "backend", "models")
 _DATA_DIR       = os.path.join(_PROJECT_ROOT, "data")
 PCAP_PATH       = os.path.join(_DATA_DIR, "live_traffic.pcap")
-CAPTURE_INTERFACE = os.getenv("SENTINELIQ_CAPTURE_INTERFACE", "4")  # Ethernet 2 = VirtualBox 192.168.56.x
+CAPTURE_INTERFACE = os.getenv("SENTINELIQ_CAPTURE_INTERFACE", "7")  # Ethernet 2 = VirtualBox 192.168.56.x
 _SIEM_HOSTNAME    = socket.gethostname()  # used as device_id for locally-captured traffic
 CAPTURE_DURATION  = 10    # seconds — reduced for faster detection
 CAPTURE_COOLDOWN  = 0    # no pause between captures
@@ -151,6 +152,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Authentication middleware ─────────────────────────────────
+# Public: login + health check
+# Forwarder: X-API-Key header required (forwarder can't do OAuth2)
+# Everything else: Bearer JWT required
+_PUBLIC_PATHS = frozenset({"/api/auth/login", "/"})
+_FORWARDER_PATHS = frozenset({"/api/logs/ingest/bulk", "/api/pcap/ingest"})
+
+class _AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # CORS preflight — browser sends OPTIONS with no auth header, let CORSMiddleware handle it
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        path = request.url.path
+        if path in _PUBLIC_PATHS:
+            return await call_next(request)
+        if path in _FORWARDER_PATHS:
+            key = request.headers.get("X-Api-Key", "") or request.headers.get("X-API-Key", "")
+            if key != settings.FORWARDER_API_KEY:
+                return JSONResponse({"detail": "Invalid or missing API key"}, status_code=401,
+                                    headers={"WWW-Authenticate": "ApiKey"})
+            return await call_next(request)
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401,
+                                headers={"WWW-Authenticate": "Bearer"})
+        try:
+            decode_token(auth_header[7:])
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code,
+                                headers=exc.headers or {})
+        return await call_next(request)
+
+app.add_middleware(_AuthMiddleware)
 
 import asyncio
 main_loop = None
@@ -1002,32 +1037,6 @@ class BulkLogRequest(PydanticBase):
     device_id: str = ""   # device that sent this batch; overrides per-entry if set
 
 
-@app.post("/api/logs/ingest")
-async def ingest_log(entry: LogEntry, request: Request):
-    """Ingest a single log line."""
-    source = entry.source
-    raw    = entry.raw.strip()
-    if not raw:
-        return {"status": "skipped", "reason": "empty"}
-
-    _log_source_stats[source]["received"] += 1
-    _log_source_stats[source]["last_seen"] = datetime.utcnow().isoformat()
-
-    if _log_parser is None:
-        return {"status": "error", "reason": "log_parser not available"}
-
-    event = _log_parser.parse(source=source, raw=raw)
-    if not event:
-        return {"status": "skipped", "reason": "unrecognized or benign"}
-
-    client_ip = request.client.host if request.client else ""
-    fired = await _evaluate_and_save_log_event(event, entry.device_id, client_ip)
-    return {
-        "status": "alert_fired" if fired else "ingested",
-        "event_type": event.event_type,
-        "src_ip": event.src_ip,
-    }
-
 
 @app.post("/api/logs/ingest/bulk")
 async def ingest_bulk(payload: BulkLogRequest, request: Request):
@@ -1067,13 +1076,6 @@ async def ingest_bulk(payload: BulkLogRequest, request: Request):
 
     return {"status": "ok", **results}
 
-
-@app.get("/api/logs/sources")
-async def log_sources():
-    return {
-        "sources": [{"source": src, **stats} for src, stats in _log_source_stats.items()],
-        "endpoints": {"single": "POST /api/logs/ingest", "bulk": "POST /api/logs/ingest/bulk"},
-    }
 
 
 # =============================================================================
@@ -1407,12 +1409,6 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@app.get("/api/auth/me")
-async def read_users_me(current_user: str = Depends(verify_token)):
-    return {"username": current_user} 
-
-    
-
 
 @app.get("/api/stats")
 async def get_stats(days: int = Query(7, ge=1, le=30)):
@@ -1693,19 +1689,6 @@ async def alert_context(alert_id: int):
         return {"error": str(e), "related_alerts": [], "related_logs": []}
 
 
-@app.get("/api/active-defense/enabled")
-async def get_active_defense_enabled():
-    return {"enabled": _active_defense_on}
-
-
-@app.post("/api/active-defense/toggle")
-async def toggle_active_defense():
-    global _active_defense_on
-    _active_defense_on = not _active_defense_on
-    state = "ENABLED" if _active_defense_on else "DISABLED"
-    print(f"[ACTIVE DEFENSE] {state} by user via dashboard")
-    return {"enabled": _active_defense_on}
-
 
 @app.post("/api/active-defense/flush-all")
 async def flush_all_blocks():
@@ -1881,40 +1864,12 @@ async def toggle_device_defense(device_id: str = Query(...), enabled: bool = Que
     return {"device_id": device_id, "enabled": enabled}
 
 
-@app.post("/api/active-defense/check")
-async def active_defense_check(ip: str = Query(...), user_agent: str = Query(None)):
-    """Check if an IP or User-Agent is currently banned."""
-    is_blocked, reason = active_defense.check_and_block(ip, user_agent)
-    return {"ip": ip, "user_agent": user_agent, "is_blocked": is_blocked, "reason": reason}
-
 
 @app.get("/api/active-defense/bans")
 async def active_defense_bans():
     """List all currently active bans."""
     return {"bans": active_defense.get_active_bans()}
 
-
-@app.post("/api/active-defense/ban-ip")
-async def active_defense_ban_ip(
-    ip: str = Query(...),
-    reason: str = Query("Manual ban"),
-    ttl: int = Query(600),
-):
-    """Manually ban an IP address with an optional TTL."""
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid IP address format: {ip}")
-    if not _is_blockable_ip(ip):
-        raise HTTPException(status_code=400, detail=f"Cannot ban IP: {ip}")
-    entry = active_defense.ban_ip(ip, reason=reason, attack_type="Manual", ttl=ttl)
-    return {"success": True, "ban": entry.to_dict()}
-
-
-@app.get("/api/active-defense/stats")
-async def active_defense_stats():
-    """Return active defense statistics."""
-    return active_defense.get_stats()
 
 
 @app.get("/api/kill-switch/status")
@@ -2006,8 +1961,11 @@ def root():
 # START BACKGROUND THREADS
 # =============================================================================
 
-Thread(target=capture_thread, daemon=True).start()
-Thread(target=process_thread,  daemon=True).start()
+if settings.CAPTURE_ENABLED:
+    Thread(target=capture_thread, daemon=True).start()
+    Thread(target=process_thread,  daemon=True).start()
+else:
+    print("[*] Local PCAP capture DISABLED (CAPTURE_ENABLED=False) — using remote forwarder only")
 
 print(f"[*] Dashboard: http://localhost:3000")
 print("-" * 60)

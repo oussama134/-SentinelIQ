@@ -53,11 +53,10 @@ WHITELIST_IP_PREFIXES = [
 
 DYNAMIC_WHITELIST = set()
 
-# IPs that are benign only when they are the SOURCE (server's own outbound traffic in cloud/VM setups).
+# IPs that are benign only when they are the SOURCE (server's own outbound traffic).
 # When the same prefix appears as the DESTINATION it is NOT skipped — inbound attacks are still detected.
 SRC_ONLY_SKIP_PREFIXES = [
-    "10.0.",       # OCI / generic cloud private VNICs — server's own egress connections
-    "169.254.",    # Link-local: OCI instance metadata service, APIPA
+    "169.254.",    # Link-local / APIPA
 ]
 
 def _ip_matches_entry(ip: str, entry: str) -> bool:
@@ -203,6 +202,18 @@ def post_process_prediction(label, score, flow_info):
     # SSH brute force must target port 22
     if 'SSH-Patator' in label and dst_port != 22:
         return "BENIGN", score * 0.3
+
+    # High-rate single-source traffic to port 22 is SSH brute force, not DDoS.
+    # CICIDS2017 DDoS flows have similar packet-rate signatures to brute force;
+    # port 22 as destination is an unambiguous SSH context.
+    if 'DDoS' in label and dst_port == 22:
+        return 'SSH-Patator', score
+
+    # Single-source high-rate traffic to web ports is scanning/bot behaviour.
+    # Real DDoS in CICIDS2017 involves many source IPs; a lone attacker
+    # hammering HTTP endpoints matches Bot or scanner, not volumetric DDoS.
+    if 'DDoS' in label and dst_port in (80, 443, 8080, 8443):
+        return 'Bot', score * 0.85
 
     # Web attacks must target web ports
     if 'Web Attack' in label and dst_port not in (80, 443, 8080, 8443):
