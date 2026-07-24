@@ -52,7 +52,7 @@ When ransomware is confirmed, it can network-isolate or shut down the victim mac
              UnifiedLog  (common schema for all sources)
                           │
                           ▼
-          Correlation Engine  (31 rules)
+          Correlation Engine  (28 rules)
           sliding-window counts per (event_type, src_ip)
           ML confidence check → count threshold check → alert
           per-class thresholds · 60s alert suppressor
@@ -87,12 +87,12 @@ A two-layer LSTM (hidden\_dim=64, seq\_len=5 flows) trained on the Canadian Inst
 
 A sliding-window event counter that groups events by source IP against time-windowed thresholds, with prefix-matching rule families and a per-(IP, rule) suppressor to prevent alert storms.
 
-| Severity | Count | Examples |
-|----------|-------|---------|
-| CRITICAL | 10 | SQL injection, Heartbleed, DDoS, root login, ransomware VSS deletion, mass encryption |
-| HIGH | 10 | SSH/FTP brute force, web scanner UA, privilege escalation via sudo, path traversal |
-| MEDIUM | 7 | Port scan, XSS, 4xx flood (directory probe), SSH invalid user |
-| LOW | 4 | First SSH failure, first invalid username — early-warning reconnaissance signals |
+| Severity | Count | Examples                                                                              |
+|----------|-------|---------------------------------------------------------------------------------------|
+| CRITICAL |  10   | SQL injection, Heartbleed, DDoS, root login, ransomware VSS deletion, mass encryption |
+| HIGH     |  10   | SSH/FTP brute force, web scanner UA, privilege escalation via sudo, path traversal    |
+| MEDIUM   |  7    | Port scan, XSS, 4xx flood (directory probe), SSH invalid user                         |
+| LOW      |  4    | First SSH failure, first invalid username — early-warning reconnaissance signals       
 
 Rules R030 and R031 (ransomware detection) arm the Kill Switch in addition to generating an alert.
 
@@ -100,28 +100,28 @@ Rules R030 and R031 (ransomware detection) arm the Kill Switch in addition to ge
 
 Every alert is automatically tagged with tactic, technique ID, technique name, and kill chain stage across 9 MITRE tactics. The dashboard renders a kill chain coverage heatmap.
 
-| Tactic | Techniques |
-|--------|-----------|
-| Reconnaissance | T1046 Network Service Discovery |
-| Initial Access | T1189 Drive-by · T1190 Exploit Public App |
-| Credential Access | T1110 Brute Force · T1552.004 Heartbleed |
-| Privilege Escalation | T1548.003 Sudo abuse |
-| Discovery | T1083 File/Directory (path traversal) |
-| Lateral Movement | T1210 Remote Services exploitation |
-| Command & Control | T1071.001 Application Layer Protocol |
-| Defense Evasion | T1562 Impair Defenses |
-| Impact | T1499 DoS · T1498 DDoS · T1486 Ransomware · T1490 VSS deletion |
+|    Tactic            |                Techniques                                      |
+|----------------------|----------------------------------------------------------------|
+| Reconnaissance       | T1046 Network Service Discovery                                |
+| Initial Access       | T1189 Drive-by · T1190 Exploit Public App                      |
+| Credential Access    | T1110 Brute Force · T1552.004 Heartbleed                       |
+| Privilege Escalation | T1548.003 Sudo abuse                                           |
+| Discovery            | T1083 File/Directory (path traversal)                          |
+| Lateral Movement     | T1210 Remote Services exploitation                             |
+| Command & Control    | T1071.001 Application Layer Protocol                           |
+| Defense Evasion      | T1562 Impair Defenses                                          |
+| Impact               | T1499 DoS · T1498 DDoS · T1486 Ransomware · T1490 VSS deletion |
 
 ### Multi-Source Log Ingestion
 
 `ubuntu_forwarder.py` runs on any Linux host, tails four log sources in real-time, batches every 2 seconds, and ships to the SIEM over HTTP. Handles log rotation, syslog noise pre-filtering, and PCAP upload via tcpdump. Zero external dependencies — standard library only.
 
-| Source | What it catches |
-|--------|----------------|
-| `/var/log/auth.log` | SSH failures, invalid users, root login attempts, sudo commands |
-| `/var/log/nginx/access.log` | SQL injection, XSS, path traversal, scanner User-Agents, 4xx floods |
-| `/var/log/apache2/access.log` | Same as nginx |
-| `/var/log/syslog` | UFW blocks, service failures, OOM killer, iptables events (keyword pre-filtered) |
+| Source | What it catches                                                                            |
+|--------|--------------------------------------------------------------------------------------------|
+| `/var/log/auth.log`           | SSH failures, invalid users, root login attempts, sudo commands     |
+| `/var/log/nginx/access.log`   | SQL injection, XSS, path traversal, scanner User-Agents, 4xx floods |
+| `/var/log/apache2/access.log` | Same as nginx                                                       |
+| `/var/log/syslog`             | UFW blocks, service failures, OOM killer, iptables events (keyword pre-filtered) |
 
 ### Active Defense
 
@@ -155,16 +155,16 @@ Every alert's source IP is asynchronously enriched after alert persistence (neve
 
 ## Stack
 
-| Layer | Technology |
-|-------|-----------|
-| Machine Learning | PyTorch · scikit-learn · CICIDS2017 |
-| Backend API | Python 3.11 · FastAPI · uvicorn · asyncio |
-| Database | PostgreSQL · SQLAlchemy async · asyncpg |
-| Packet capture | tshark (Windows) · tcpdump (Linux) |
-| Frontend | React 18 · Tailwind CSS · lucide-react |
-| Authentication | JWT · bcrypt |
-| Threat Intel | aiohttp · ip-api.com · AbuseIPDB |
-| Remote response | OpenSSH · iptables · ufw · PowerShell |
+| Layer              |              Technology                   |
+|--------------------|-------------------------------------------|
+| Machine Learning   | PyTorch · scikit-learn · CICIDS2017       |
+| Backend API        | Python 3.11 · FastAPI · uvicorn · asyncio |
+| Database           | PostgreSQL · SQLAlchemy async · asyncpg   |
+| Packet capture     | tshark (Windows) · tcpdump (Linux)        |
+| Frontend           | React 18 · Tailwind CSS · lucide-react    |
+| Authentication     | JWT · bcrypt                              |
+| Threat Intel       | aiohttp · ip-api.com · AbuseIPDB          |
+| Remote response    | OpenSSH · iptables · ufw · PowerShell     |
 
 ---
 
@@ -310,8 +310,8 @@ python attack_simulator_multi_ip.py # Multi-source network attacks
 
 Every component built from scratch. No managed detection libraries. No pre-built SIEM engines.
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-oussama--aouass-0A66C2?style=flat&logo=linkedin)](https://linkedin.com/in/oussama-aouass)
-[![Email](https://img.shields.io/badge/Email-oussama.aouass10@gmail.com-EA4335?style=flat&logo=gmail&logoColor=white)](mailto:oussama.aouass10@gmail.com)
+[![LinkedIn] = (https://www.linkedin.com/in/oussama-aouass-818b87291/)
+[![Email]    = oussama.aouass10@gmail.com)
 
 ---
 
